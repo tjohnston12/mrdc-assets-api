@@ -142,6 +142,21 @@ module.exports = async function handler(req, res) {
       CACHE = { at: Date.now(), data: register };
     }
 
+    // distinct category (asset_type) values with counts — used to map each OMM
+    // standard to the asset type its audit should match against.
+    const types = req.query?.types === '1' || /[?&]types=1/.test(req.url || '');
+    if (types) {
+      const tally = {};
+      for (const a of register) {
+        const k = a.category || '(blank)';
+        tally[k] = (tally[k] || 0) + 1;
+      }
+      const list = Object.entries(tally).sort((x, y) => y[1] - x[1])
+        .map(([category, count]) => ({ category, count }));
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      return res.status(200).json({ total: register.length, types: list });
+    }
+
     // single-asset lookup by id — what DMT intake calls to resolve route/km/lat/lng.
     const id = req.query?.id || (req.url.match(/[?&]id=([^&]+)/) || [])[1];
     if (id) {
