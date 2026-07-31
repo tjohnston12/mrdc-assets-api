@@ -44,7 +44,8 @@ const F = {
 };
 
 // cache the register in the warm lambda (assets change rarely)
-let CACHE = { at: 0, data: null };
+// data = mappable assets only (lat/lng present); all = every asset (for pickers)
+let CACHE = { at: 0, data: null, all: null };
 const TTL_MS = 5 * 60 * 1000;
 
 async function airtable(path) {
@@ -79,15 +80,16 @@ function num(v) {
   return Number.isFinite(n) ? n : null;
 }
 
-function shape(records) {
+function shape(records, includeUnmapped) {
   const out = [];
   for (const r of records) {
     const f = r.fields || {};
     const lat = num(f[F.lat]);
     const lng = num(f[F.lng]);
-    if (lat == null || lng == null) continue;       // must be mappable
+    if (!includeUnmapped && (lat == null || lng == null)) continue;   // map consumers need coordinates
     const asset = {
       id: f[F.id] != null && f[F.id] !== '' ? String(f[F.id]) : r.id,
+      recId: r.id,                                   // Airtable record id — lets consumers deep-link the record
       name: f[F.name] != null ? String(f[F.name]) : '',
       category: f[F.category] != null ? String(f[F.category]) : '',
       lat, lng,
@@ -135,12 +137,14 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // build (or reuse cached) register
-    let register = CACHE.data && Date.now() - CACHE.at < TTL_MS ? CACHE.data : null;
-    if (!register) {
-      register = shape(await fetchAll());
-      CACHE = { at: Date.now(), data: register };
+    // build (or reuse cached) register — shape once into mappable-only + full sets
+    if (!CACHE.data || Date.now() - CACHE.at >= TTL_MS) {
+      const raw = await fetchAll();
+      CACHE = { at: Date.now(), data: shape(raw, false), all: shape(raw, true) };
     }
+    // ?all=1 → include assets that have no lat/lng too (for asset pickers, not maps)
+    const includeAll = req.query?.all === '1' || /[?&]all=1/.test(req.url || '');
+    let register = includeAll ? CACHE.all : CACHE.data;
 
     // distinct category (asset_type) values with counts — used to map each OMM
     // standard to the asset type its audit should match against.

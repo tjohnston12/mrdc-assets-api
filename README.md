@@ -13,7 +13,8 @@ exactly one place.
 
 | Request | Returns |
 |---|---|
-| `GET /api/assets` | full register: `[{ id, name, category, lat, lng, route?, km? }]` |
+| `GET /api/assets` | full register (mappable assets only): `[{ id, recId, name, category, lat, lng, route?, km? }]` |
+| `GET /api/assets?all=1` | every asset incl. those with no lat/lng — for asset pickers, not maps |
 | `GET /api/assets?id=BR-0012` | one asset (what DMT intake calls), or 404 |
 | `GET /api/assets?debug=1` | table name + real column names + a sample record (schema check) |
 
