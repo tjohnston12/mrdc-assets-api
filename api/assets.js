@@ -44,6 +44,9 @@ const F = {
   // asset_ref = the human/legacy asset number (e.g. a culvert's "1-C40b"); the real
   // column is already 'asset_ref', so no env override is normally needed.
   ref:      process.env.ASSET_F_REF      || 'asset_ref',
+  // source_ref / source_system link a registry row back to the ORIGINAL Asset Database
+  // record (where the real photo attachments live) — used to resolve a fresh photo.
+  sourceRef: process.env.ASSET_F_SOURCEREF || 'source_ref',
 };
 
 // cache the register in the warm lambda (assets change rarely)
@@ -102,38 +105,51 @@ function shape(records, includeUnmapped) {
     const km = num(f[F.km]);
     if (km != null) asset.km = km;
     if (f[F.ref] != null && f[F.ref] !== '') asset.asset_ref = String(f[F.ref]);
+    if (f[F.sourceRef] != null && f[F.sourceRef] !== '') asset.source_ref = String(f[F.sourceRef]);
     out.push(asset);
   }
   return out;
 }
 
-// Per-type detail table + photo-URL field(s). The first non-blank wins. Photos live
-// in the detail tables (keyed by the same asset_id), not on the Assets row itself.
-const PHOTO_MAP = {
-  'Sign':               { table: 'tblcRZosz76z6g2vk', fields: ['photo_url', 'photo_back_url'] },
-  'Culvert':            { table: 'tblDyYac0QWCQtxQv', fields: ['photo_eb_url', 'photo_wb_url', 'photo_median_url'] },
-  'Guiderail':          { table: 'tblUwHs6Im2OY7Arc', fields: ['leading_end_photo_url', 'terminating_end_photo_url'] },
-  'Barrier Wall':       { table: 'tblfDzv7MlCqCDncd', fields: ['photo_url'] },
-  'Wildlife Fence':     { table: 'tblW7bcJpCiSYKABl', fields: ['photo_url'] },
-  'Fencing':            { table: 'tblW7bcJpCiSYKABl', fields: ['photo_url'] },
-  'Gate':               { table: 'tbl5sldKignbSszJV', fields: ['photo_url'] },
-  'Lighting':           { table: 'tblrEdE23o4BNtlmM', fields: ['photo_url'] },
-  'Drainage Structure': { table: 'tblK2La03BWIjxVB3', fields: ['photo_url'] },
-  'Structure':          { table: 'tblYM98CKDkmYhB4A', fields: ['attachment_urls'] },
+// Photos live in the ORIGINAL Asset Database base as real attachment fields — reading
+// them via the API returns a FRESH signed URL every time (the copies in the registry's
+// detail tables are stale text URLs that expire). Each registry row links back via
+// source_ref (= the original table's asset-no) or, for culverts, asset_ref (e.g. "1-C40b").
+const ORIG_BASE = process.env.ORIG_ASSET_BASE || 'appQ9RjCAgXQt9eR2';
+const ORIG_PHOTO = {
+  'Sign':               { table: 'tblLAeXhFsC9cCeCo', key: 'asset no.', match: a => a.source_ref || a.id, photos: ['Photo Front', 'Photo Back'] },
+  'Culvert':            { table: 'tblgSrCOw50Thp4P0', key: 'Asset No',  match: a => a.asset_ref,           photos: ['Photo - RS - EB', 'Photo - RS - WB', 'Photo - Median'] },
+  'Guiderail':          { table: 'tblQeAd8m9sSktNPU', key: 'asset no.', match: a => a.source_ref || a.id, photos: ['Leading End - Photo', 'Terminating End - Photo'] },
+  'Barrier Wall':       { table: 'tblrYBQIqsCkhFzWf', key: 'Name',      match: a => a.source_ref || a.id, photos: ['Leading End'] },
+  'Wildlife Fence':     { table: 'tblTyJuNPEDND9pZc', key: 'Asset No.', match: a => a.source_ref || a.id, photos: ['Photo'] },
+  'Fencing':            { table: 'tblTyJuNPEDND9pZc', key: 'Asset No.', match: a => a.source_ref || a.id, photos: ['Photo'] },
+  'Lighting':           { table: 'tblSXhMx5QG2ZNFkB', key: 'Asset No.', match: a => a.source_ref || a.id, photos: ['New Photo', 'Photo - ApiFlash', 'Lighting Photo - Script'] },
+  'Structure':          { table: 'tbl89vtRdejggeG9F', key: 'Asset No.', match: a => a.source_ref || a.id, photos: ['Photo'] },
+  'Drainage Structure': { table: 'tblI0vQTViJuCADFM', key: 'Asset No.', match: a => a.source_ref || a.id, photos: ['Photo'] },
 };
-// Look up the asset's photo from its type detail table by matching asset_id.
+// First attachment's URL — prefer the 'large' thumbnail (fast, still fresh) over full size.
+function attUrl(v) {
+  if (!Array.isArray(v) || !v[0]) return null;
+  const a = v[0];
+  return (a.thumbnails && a.thumbnails.large && a.thumbnails.large.url) || a.url || null;
+}
+async function airtableIn(base, path) {
+  const res = await fetch(`https://api.airtable.com/v0/${base}/${path}`, { headers: { Authorization: `Bearer ${PAT}` } });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) { const e = new Error(json.error?.message || `Airtable ${res.status}`); e.status = res.status; throw e; }
+  return json;
+}
+// Resolve the asset's photo from the original Asset Database (fresh attachment URL).
 async function resolvePhoto(asset) {
-  const map = PHOTO_MAP[asset.category];
-  if (!map || !asset.id) return null;
-  const formula = `{asset_id}='${String(asset.id).replace(/'/g, "\\'")}'`;
-  const qs = new URLSearchParams({ maxRecords: '1', filterByFormula: formula });
-  for (const f of map.fields) qs.append('fields[]', f);
-  const j = await airtable(`${map.table}?${qs}`);
+  const cfg = ORIG_PHOTO[asset.category];
+  if (!cfg) return null;
+  const val = cfg.match(asset);
+  if (!val) return null;
+  const qs = new URLSearchParams({ maxRecords: '1', filterByFormula: `{${cfg.key}}='${String(val).replace(/'/g, "\\'")}'` });
+  for (const f of cfg.photos) qs.append('fields[]', f);
+  const j = await airtableIn(ORIG_BASE, `${cfg.table}?${qs}`);
   const df = (j.records && j.records[0] && j.records[0].fields) || {};
-  for (const f of map.fields) {
-    const v = String(df[f] || '').split(/\n+/)[0].trim();   // attachment_urls may hold several
-    if (v) return v;
-  }
+  for (const f of cfg.photos) { const u = attUrl(df[f]); if (u) return u; }
   return null;
 }
 

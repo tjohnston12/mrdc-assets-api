@@ -24,7 +24,8 @@ exactly one place.
 
 | Var | Required | Notes |
 |---|---|---|
-| `AIRTABLE_PAT` | yes | token with **read** access to base `app0sXrUbOBr7a6vV` |
+| `AIRTABLE_PAT` | yes | token with **read** access to base `app0sXrUbOBr7a6vV` — and, for asset photos on the `?id=` lookup, **also** the original Asset Database base `appQ9RjCAgXQt9eR2` (real photo attachments live there) |
+| `ORIG_ASSET_BASE` | no | original Asset Database base for photos; defaults to `appQ9RjCAgXQt9eR2` |
 | `ASSETS_PAT` | no | overrides `AIRTABLE_PAT` just for this service |
 | `ASSETS_BASE` | no | defaults to `app0sXrUbOBr7a6vV` |
 | `ASSETS_TABLE` | no | defaults to `Assets` — set if the table is named differently |
