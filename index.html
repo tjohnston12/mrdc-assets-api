@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Asset 360 — MRDC HTRA</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --navy:#1E2B5E; --ink:#0E1C33; --line:#e4e7ef; --muted:#6b7488; --bg:#f5f6fa;
+    --wine:#8A2D5B; --blue:#1B4F8A; --amber:#B8860B; --bad:#A32D2D; --good:#1BAF7A;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:#15181f;font-family:'DM Sans',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:14px;line-height:1.5}
+  a{color:var(--blue)}
+  .wrap{max-width:1000px;margin:0 auto;padding:22px 16px 60px}
+  .muted{color:var(--muted)}
+  .small{font-size:12.5px}
+  /* header */
+  .hero{background:#fff;border:1px solid var(--line);border-radius:14px;padding:20px 22px;box-shadow:0 1px 2px rgba(20,25,40,.04)}
+  .hero h1{margin:0 0 4px;font-size:22px;color:var(--ink);font-weight:700}
+  .hero .sub{font-size:13.5px;color:var(--muted)}
+  .badge{display:inline-block;background:#eef2fb;color:var(--navy);border:1px solid #d7e0f2;border-radius:99px;padding:2px 11px;font-size:12px;font-weight:600;vertical-align:middle;margin-left:8px}
+  dl.facts{display:grid;grid-template-columns:120px 1fr;gap:6px 14px;margin:16px 0 0;font-size:13.5px}
+  dl.facts dt{color:var(--muted);font-weight:600}
+  dl.facts dd{margin:0}
+  /* sections */
+  .sec{margin-top:26px}
+  .sec h2{font-size:15px;color:var(--ink);margin:0 0 10px;display:flex;align-items:center;gap:9px}
+  .cnt{background:var(--navy);color:#fff;border-radius:99px;font-size:12px;font-weight:600;padding:1px 9px;min-width:22px;text-align:center}
+  .card{background:#fff;border:1px solid var(--line);border-radius:11px;padding:13px 15px;margin-bottom:9px;box-shadow:0 1px 2px rgba(20,25,40,.03)}
+  .card .top{display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap}
+  .card .id{font-weight:700;font-size:15px}
+  .card .id a{text-decoration:none}
+  .card .meta{color:var(--muted);font-size:13px;margin-top:3px}
+  .card .desc{margin-top:6px;font-size:13px}
+  .pill{display:inline-block;border-radius:99px;padding:2px 10px;font-size:11.5px;font-weight:600;white-space:nowrap}
+  .p-open{background:#E7EFFA;color:#1B4F8A}.p-closed{background:#E7F6EF;color:#0F7A4E}
+  .p-crit{background:#FBE9E9;color:#A32D2D}.p-warn{background:#FDF0DD;color:#8A5B00}
+  .overdue{color:var(--bad);font-weight:600}
+  .empty{color:var(--muted);font-style:italic;padding:6px 2px}
+  .err{background:#FBE9E9;border:1px solid #f0cccc;color:#7d2020;border-radius:10px;padding:10px 12px;font-size:13px}
+  .pickwrap{background:#fff;border:1px solid var(--line);border-radius:14px;padding:26px 22px;text-align:center}
+  .pickwrap input{width:100%;max-width:460px;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:14px;font-family:inherit;margin-top:12px}
+  .openlink{font-size:12.5px;font-weight:600;text-decoration:none}
+  .spin{color:var(--muted);padding:14px 2px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="root"><div class="spin">Loading…</div></div>
+</div>
+
+<script>
+const ASSET_BASE = 'app0sXrUbOBr7a6vV', ASSET_TABLE_ID = 'tbll88se1AcceHDhW';
+const NC_API  = 'https://nc.mrdc-htra.com/api/ncs';
+const DMT_API = 'https://dmt.mrdc-htra.com/api/work-orders';
+const NC_APP  = 'https://nc.mrdc-htra.com';
+const DMT_APP = 'https://dmt.mrdc-htra.com';
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const root = $('#root');
+const qs = new URLSearchParams(location.search);
+const ASSET_ID = (qs.get('id') || '').trim();
+const today = new Date().toISOString().slice(0,10);
+
+const TERMINAL_NC  = ['Closed','Cancelled'];
+const TERMINAL_DMT = ['Resolved','Verified','Closed','Cancelled'];
+const ncOpen  = s => !TERMINAL_NC.includes(s || 'New');
+const dmtOpen = s => !TERMINAL_DMT.includes(s || 'New');
+
+function statusPill(status, open){
+  const cls = open ? 'p-open' : 'p-closed';
+  return `<span class="pill ${cls}">${esc(status || 'New')}</span>`;
+}
+function prioPill(p){
+  if(!p) return '';
+  const cls = p === 'Critical' ? 'p-crit' : (p === 'Important' || p === 'High') ? 'p-warn' : 'p-open';
+  return ` <span class="pill ${cls}">${esc(p)}</span>`;
+}
+function dueBit(due, open){
+  if(!due) return '';
+  const od = open && due < today;
+  return ` · <span class="${od?'overdue':''}">Due ${esc(due)}${od?' — overdue':''}</span>`;
+}
+
+async function getJSON(url){
+  const r = await fetch(url, { headers:{ 'Accept':'application/json' } });
+  if(!r.ok) throw new Error(url + ' → ' + r.status);
+  return r.json();
+}
+
+// ---- no id: asset chooser ----
+async function renderChooser(){
+  root.innerHTML = `<div class="pickwrap">
+    <h1 style="margin:0;font-size:20px;color:var(--ink)">Asset 360</h1>
+    <div class="muted small" style="margin-top:6px">Pick an asset to see everything recorded against it — non-conformances, DMT work orders and more.</div>
+    <input id="pick" list="alist" placeholder="Search asset ID or name…" autocomplete="off">
+    <datalist id="alist"></datalist>
+  </div>`;
+  try{
+    const list = await getJSON('/api/assets?all=1');
+    const dl = $('#alist');
+    dl.innerHTML = list.map(a => `<option value="${esc(a.id)}" label="${esc([a.name,a.category].filter(Boolean).join(' · '))}">`).join('');
+    const byId = {}; list.forEach(a => byId[String(a.id)] = a);
+    $('#pick').addEventListener('change', function(){
+      const v = this.value.trim();
+      if(byId[v]) location.search = '?id=' + encodeURIComponent(v);
+    });
+  }catch(e){ /* chooser still usable if list fails */ }
+}
+
+// ---- asset header ----
+function renderHero(a){
+  const routeLabel = a.route ? (/^\d/.test(String(a.route)) ? `Route ${esc(a.route)}` : esc(a.route)) : '';
+  const loc = [routeLabel, (a.km!=null && a.km!=='') ? `km ${esc(a.km)}` : ''].filter(Boolean).join(' · ');
+  const gps = (a.lat!=null && a.lng!=null) ? `<a href="https://www.google.com/maps?q=${a.lat},${a.lng}" target="_blank" rel="noopener">${a.lat}, ${a.lng}</a>` : '<span class="muted">—</span>';
+  const airtable = a.recId ? `https://airtable.com/${ASSET_BASE}/${ASSET_TABLE_ID}/${a.recId}` : '';
+  return `<div class="hero">
+    <h1>${esc(a.name || a.id)}${a.category?`<span class="badge">${esc(a.category)}</span>`:''}</h1>
+    <div class="sub">${esc(a.id)}</div>
+    <dl class="facts">
+      <dt>Location</dt><dd>${loc || '<span class="muted">—</span>'}</dd>
+      <dt>GPS</dt><dd>${gps}</dd>
+      ${airtable?`<dt>Record</dt><dd><a href="${airtable}" target="_blank" rel="noopener" class="openlink">Open in Airtable ↗</a></dd>`:''}
+    </dl>
+  </div>`;
+}
+
+function ncCard(n){
+  const open = ncOpen(n.Status);
+  const link = `${NC_APP}/?nc=${encodeURIComponent(n['NC #']||'')}`;
+  const line2 = [n['Notice Type'], n['Standard / Clause'], n['Responsible Person']?('Owner: '+n['Responsible Person']):''].filter(Boolean).map(esc).join(' · ');
+  const desc = n.Description ? String(n.Description).slice(0,160) : '';
+  return `<div class="card">
+    <div class="top">
+      <div class="id"><a href="${link}" target="_blank" rel="noopener">${esc(n['NC #']||'NC')}</a></div>
+      <div>${statusPill(n.Status, open)}</div>
+    </div>
+    <div class="meta">${line2 || ''}${n['Date Raised']?` · Issued ${esc(n['Date Raised'])}`:''}${dueBit(n['Due Date'], open)}</div>
+    ${desc?`<div class="desc">${esc(desc)}${String(n.Description).length>160?'…':''}</div>`:''}
+  </div>`;
+}
+
+function dmtCard(w){
+  const open = dmtOpen(w.Status);
+  const link = `${DMT_APP}/?wo=${encodeURIComponent(w['Work Order #']||'')}`;
+  const std = [w.Standard, w['Standard Title']].filter(Boolean).join(' — ');
+  const line2 = [std, w.Finding].filter(Boolean).map(esc).join(' · ');
+  const desc = w.Description ? String(w.Description).slice(0,160) : '';
+  return `<div class="card">
+    <div class="top">
+      <div class="id"><a href="${link}" target="_blank" rel="noopener">${esc(w['Work Order #']||'WO')}</a></div>
+      <div>${statusPill(w.Status, open)}${prioPill(w.Priority)}</div>
+    </div>
+    <div class="meta">${line2 || ''}${w['Date Observed']?` · Observed ${esc(w['Date Observed'])}`:''}${dueBit(w['Due Date'], open)}</div>
+    ${desc?`<div class="desc">${esc(desc)}${String(w.Description).length>160?'…':''}</div>`:''}
+  </div>`;
+}
+
+function byDateDesc(arr, field){
+  return arr.slice().sort((a,b)=> String(b[field]||'').localeCompare(String(a[field]||'')));
+}
+
+async function loadSection(kind){
+  try{
+    if(kind === 'nc'){
+      const j = await getJSON(`${NC_API}?asset=${encodeURIComponent(ASSET_ID)}&limit=500`);
+      const rows = byDateDesc(j.records || [], 'Date Raised');
+      return { count: rows.length, html: rows.length ? rows.map(ncCard).join('') : `<div class="empty">No non-conformances recorded for this asset.</div>` };
+    } else {
+      const j = await getJSON(`${DMT_API}?asset=${encodeURIComponent(ASSET_ID)}&limit=500`);
+      const rows = byDateDesc(j.records || [], 'Date Observed');
+      return { count: rows.length, html: rows.length ? rows.map(dmtCard).join('') : `<div class="empty">No DMT work orders recorded for this asset.</div>` };
+    }
+  }catch(e){
+    return { count: null, html: `<div class="err">Couldn't load this section (${esc(e.message)}). If this persists right after deploy, the API may still need its CORS/redeploy.</div>` };
+  }
+}
+
+async function renderAsset(){
+  let a = null;
+  try{ a = await getJSON('/api/assets?id=' + encodeURIComponent(ASSET_ID) + '&all=1'); }
+  catch(e){ a = null; }
+  const heroHtml = a ? renderHero(a)
+    : `<div class="hero"><h1>${esc(ASSET_ID)}</h1><div class="sub err" style="margin-top:8px">This asset ID was not found in the register. Records below are still matched by the exact ID.</div></div>`;
+
+  root.innerHTML = heroHtml +
+    `<div class="sec"><h2>Non-conformances <span class="cnt" id="nc-cnt">…</span></h2><div id="nc-list"><div class="spin">Loading…</div></div></div>` +
+    `<div class="sec"><h2>DMT work orders <span class="cnt" id="dmt-cnt">…</span></h2><div id="dmt-list"><div class="spin">Loading…</div></div></div>`;
+
+  const [nc, dmt] = await Promise.all([ loadSection('nc'), loadSection('dmt') ]);
+  $('#nc-cnt').textContent  = nc.count  == null ? '!' : nc.count;
+  $('#dmt-cnt').textContent = dmt.count == null ? '!' : dmt.count;
+  $('#nc-list').innerHTML  = nc.html;
+  $('#dmt-list').innerHTML = dmt.html;
+}
+
+(ASSET_ID ? renderAsset() : renderChooser());
+</script>
+<script src="https://www.mrdc-htra.com/app-switcher.js"></script>
+</body>
+</html>
