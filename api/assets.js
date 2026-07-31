@@ -107,6 +107,36 @@ function shape(records, includeUnmapped) {
   return out;
 }
 
+// Per-type detail table + photo-URL field(s). The first non-blank wins. Photos live
+// in the detail tables (keyed by the same asset_id), not on the Assets row itself.
+const PHOTO_MAP = {
+  'Sign':               { table: 'tblcRZosz76z6g2vk', fields: ['photo_url', 'photo_back_url'] },
+  'Culvert':            { table: 'tblDyYac0QWCQtxQv', fields: ['photo_eb_url', 'photo_wb_url', 'photo_median_url'] },
+  'Guiderail':          { table: 'tblUwHs6Im2OY7Arc', fields: ['leading_end_photo_url', 'terminating_end_photo_url'] },
+  'Barrier Wall':       { table: 'tblfDzv7MlCqCDncd', fields: ['photo_url'] },
+  'Wildlife Fence':     { table: 'tblW7bcJpCiSYKABl', fields: ['photo_url'] },
+  'Fencing':            { table: 'tblW7bcJpCiSYKABl', fields: ['photo_url'] },
+  'Gate':               { table: 'tbl5sldKignbSszJV', fields: ['photo_url'] },
+  'Lighting':           { table: 'tblrEdE23o4BNtlmM', fields: ['photo_url'] },
+  'Drainage Structure': { table: 'tblK2La03BWIjxVB3', fields: ['photo_url'] },
+  'Structure':          { table: 'tblYM98CKDkmYhB4A', fields: ['attachment_urls'] },
+};
+// Look up the asset's photo from its type detail table by matching asset_id.
+async function resolvePhoto(asset) {
+  const map = PHOTO_MAP[asset.category];
+  if (!map || !asset.id) return null;
+  const formula = `{asset_id}='${String(asset.id).replace(/'/g, "\\'")}'`;
+  const qs = new URLSearchParams({ maxRecords: '1', filterByFormula: formula });
+  for (const f of map.fields) qs.append('fields[]', f);
+  const j = await airtable(`${map.table}?${qs}`);
+  const df = (j.records && j.records[0] && j.records[0].fields) || {};
+  for (const f of map.fields) {
+    const v = String(df[f] || '').split(/\n+/)[0].trim();   // attachment_urls may hold several
+    if (v) return v;
+  }
+  return null;
+}
+
 // CORS: allow the platform's own origins (and Vercel previews), not the whole web.
 const ORIGIN_OK = /^https:\/\/([a-z0-9-]+\.)*mrdc-htra\.com$|^https:\/\/[a-z0-9-]+\.vercel\.app$/i;
 function applyCors(req, res) {
@@ -165,13 +195,16 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({ total: register.length, types: list });
     }
 
-    // single-asset lookup by id — what DMT intake calls to resolve route/km/lat/lng.
+    // single-asset lookup by id — what DMT intake calls to resolve route/km/lat/lng,
+    // and what the Asset 360 page calls (it also wants a photo).
     const id = req.query?.id || (req.url.match(/[?&]id=([^&]+)/) || [])[1];
     if (id) {
       const one = register.find(a => a.id === decodeURIComponent(String(id)));
       res.setHeader('Cache-Control', 'public, max-age=300');
-      return one ? res.status(200).json(one)
-                 : res.status(404).json({ error: 'Asset not found', id: String(id) });
+      if (!one) return res.status(404).json({ error: 'Asset not found', id: String(id) });
+      let photo = null;
+      try { photo = await resolvePhoto(one); } catch (_) { /* photo is best-effort */ }
+      return res.status(200).json({ ...one, photo });
     }
 
     res.setHeader('Cache-Control', 'public, max-age=300');

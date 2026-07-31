@@ -25,6 +25,10 @@
   dl.facts{display:grid;grid-template-columns:120px 1fr;gap:6px 14px;margin:16px 0 0;font-size:13.5px}
   dl.facts dt{color:var(--muted);font-weight:600}
   dl.facts dd{margin:0}
+  .herorow{display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap}
+  .heromain{flex:1 1 320px;min-width:0}
+  .assetphoto{flex:0 0 auto}
+  .assetphoto img{max-width:280px;max-height:210px;border-radius:9px;border:1px solid var(--line);object-fit:cover;cursor:zoom-in;display:block}
   /* sections */
   .sec{margin-top:26px}
   .sec h2{font-size:15px;color:var(--ink);margin:0 0 10px;display:flex;align-items:center;gap:9px}
@@ -118,15 +122,21 @@ function renderHero(a){
   const loc = [routeLabel, (a.km!=null && a.km!=='') ? `km ${esc(a.km)}` : ''].filter(Boolean).join(' · ');
   const gps = (a.lat!=null && a.lng!=null) ? `<a href="https://www.google.com/maps?q=${a.lat},${a.lng}" target="_blank" rel="noopener">${a.lat}, ${a.lng}</a>` : '<span class="muted">—</span>';
   const airtable = a.recId ? `https://airtable.com/${ASSET_BASE}/${ASSET_TABLE_ID}/${a.recId}` : '';
-  return `<div class="hero">
-    <h1>${esc(a.name || a.id)}${a.category?`<span class="badge">${esc(a.category)}</span>`:''}</h1>
-    <div class="sub">${esc(a.id)}</div>
-    <dl class="facts">
-      <dt>Location</dt><dd>${loc || '<span class="muted">—</span>'}</dd>
-      <dt>GPS</dt><dd>${gps}</dd>
-      ${airtable?`<dt>Record</dt><dd><a href="${airtable}" target="_blank" rel="noopener" class="openlink">Open in Airtable ↗</a></dd>`:''}
-    </dl>
-  </div>`;
+  const photo = a.photo
+    ? `<div class="assetphoto"><a href="${esc(a.photo)}" target="_blank" rel="noopener" title="Open full size"><img src="${esc(a.photo)}" alt="${esc(a.name || a.id)}" onerror="this.closest('.assetphoto').style.display='none'"></a></div>`
+    : '';
+  return `<div class="hero"><div class="herorow">
+    <div class="heromain">
+      <h1>${esc(a.name || a.id)}${a.category?`<span class="badge">${esc(a.category)}</span>`:''}</h1>
+      <div class="sub">${esc(a.id)}</div>
+      <dl class="facts">
+        <dt>Location</dt><dd>${loc || '<span class="muted">—</span>'}</dd>
+        <dt>GPS</dt><dd>${gps}</dd>
+        ${airtable?`<dt>Record</dt><dd><a href="${airtable}" target="_blank" rel="noopener" class="openlink">Open in Airtable ↗</a></dd>`:''}
+      </dl>
+    </div>
+    ${photo}
+  </div></div>`;
 }
 
 function ncCard(n){
