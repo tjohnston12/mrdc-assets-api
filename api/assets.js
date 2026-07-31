@@ -41,6 +41,9 @@ const F = {
   // service exposes them too. Included in output only when the columns exist.
   route:    process.env.ASSET_F_ROUTE    || 'Route',
   km:       process.env.ASSET_F_KM       || 'KM',
+  // asset_ref = the human/legacy asset number (e.g. a culvert's "1-C40b"); the real
+  // column is already 'asset_ref', so no env override is normally needed.
+  ref:      process.env.ASSET_F_REF      || 'asset_ref',
 };
 
 // cache the register in the warm lambda (assets change rarely)
@@ -98,6 +101,7 @@ function shape(records, includeUnmapped) {
     if (f[F.route] != null && f[F.route] !== '') asset.route = String(f[F.route]);
     const km = num(f[F.km]);
     if (km != null) asset.km = km;
+    if (f[F.ref] != null && f[F.ref] !== '') asset.asset_ref = String(f[F.ref]);
     out.push(asset);
   }
   return out;
