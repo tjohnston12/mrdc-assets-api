@@ -138,6 +138,8 @@ async function renderChooser(){
     function render(){
       const cat = sel.value;
       const query = pick.value.trim().toLowerCase();
+      // Keep the results area empty until the user searches or picks an asset type.
+      if(!cat && !query){ resultsEl.innerHTML = `<div class="empty">Search by asset ID or name, or pick an asset type to list assets.</div>`; return; }
       let rows = list;
       if(cat) rows = rows.filter(a => (a.category || '—') === cat);
       if(query) rows = rows.filter(a => (String(a.id) + ' ' + (a.name || '')).toLowerCase().includes(query));
