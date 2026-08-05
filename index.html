@@ -49,6 +49,23 @@
   .pickwrap input{width:100%;max-width:460px;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:14px;font-family:inherit;margin-top:12px}
   .openlink{font-size:12.5px;font-weight:600;text-decoration:none}
   .spin{color:var(--muted);padding:14px 2px}
+  /* chooser filters */
+  .pickctrls{display:flex;gap:10px;max-width:560px;margin:14px auto 0}
+  .pickctrls .sel{flex:0 0 auto;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:14px;font-family:inherit;background:#fff;color:#15181f}
+  .pickctrls input{flex:1 1 auto;margin-top:0;max-width:none}
+  .results{max-width:560px;margin:14px auto 0;text-align:left;max-height:60vh;overflow:auto}
+  .rrow{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--line);border-radius:9px;margin-bottom:7px;text-decoration:none;color:#15181f;background:#fff}
+  .rrow:hover{border-color:var(--navy);background:#f7f9fe}
+  .rrow .rid{font-weight:700;font-size:13.5px;flex:0 0 auto}
+  .rrow .rname{color:var(--muted);font-size:13px;flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .rrow .badge{margin-left:0}
+  /* per-asset filter bar */
+  .filterbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:22px}
+  .fgroup{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:#fff}
+  .fbtn{appearance:none;border:0;border-right:1px solid var(--line);background:#fff;color:var(--muted);font-family:inherit;font-size:13px;font-weight:600;padding:7px 14px;cursor:pointer}
+  .fbtn:last-child{border-right:0}
+  .fbtn.active{background:var(--navy);color:#fff}
+  .filterbar .sel{padding:7px 12px;border:1px solid var(--line);border-radius:9px;font-size:13px;font-family:inherit;font-weight:600;background:#fff;color:#15181f}
 </style>
 </head>
 <body>
@@ -96,24 +113,47 @@ async function getJSON(url){
   return r.json();
 }
 
-// ---- no id: asset chooser ----
+// ---- no id: asset chooser (filter by asset type + search) ----
 async function renderChooser(){
   root.innerHTML = `<div class="pickwrap">
     <h1 style="margin:0;font-size:20px;color:var(--ink)">Asset 360</h1>
     <div class="muted small" style="margin-top:6px">Pick an asset to see everything recorded against it — non-conformances, DMT work orders and more.</div>
-    <input id="pick" list="alist" placeholder="Search asset ID or name…" autocomplete="off">
-    <datalist id="alist"></datalist>
+    <div class="pickctrls">
+      <select id="cat" class="sel" aria-label="Filter by asset type"><option value="">All types</option></select>
+      <input id="pick" placeholder="Search asset ID or name…" autocomplete="off">
+    </div>
+    <div id="results" class="results"><div class="spin">Loading assets…</div></div>
   </div>`;
+  const resultsEl = $('#results');
   try{
     const list = await getJSON('/api/assets?all=1');
-    const dl = $('#alist');
-    dl.innerHTML = list.map(a => `<option value="${esc(a.id)}" label="${esc([a.name,a.category].filter(Boolean).join(' · '))}">`).join('');
-    const byId = {}; list.forEach(a => byId[String(a.id)] = a);
-    $('#pick').addEventListener('change', function(){
-      const v = this.value.trim();
-      if(byId[v]) location.search = '?id=' + encodeURIComponent(v);
-    });
-  }catch(e){ /* chooser still usable if list fails */ }
+    // asset types with counts, for the filter dropdown
+    const tally = {};
+    list.forEach(a => { const k = a.category || '—'; tally[k] = (tally[k]||0)+1; });
+    const cats = Object.keys(tally).sort((x,y)=>x.localeCompare(y));
+    const sel = $('#cat');
+    sel.innerHTML = `<option value="">All types (${list.length})</option>` +
+      cats.map(c => `<option value="${esc(c)}">${esc(c)} (${tally[c]})</option>`).join('');
+    const pick = $('#pick');
+    function render(){
+      const cat = sel.value;
+      const query = pick.value.trim().toLowerCase();
+      let rows = list;
+      if(cat) rows = rows.filter(a => (a.category || '—') === cat);
+      if(query) rows = rows.filter(a => (String(a.id) + ' ' + (a.name || '')).toLowerCase().includes(query));
+      rows = rows.slice().sort((a,b)=> String(a.name || a.id).localeCompare(String(b.name || b.id)));
+      const shown = rows.slice(0, 200);
+      resultsEl.innerHTML = rows.length
+        ? shown.map(a => `<a class="rrow" href="?id=${encodeURIComponent(a.id)}"><span class="rid">${esc(a.id)}</span><span class="rname">${esc(a.name || '')}</span>${a.category?`<span class="badge">${esc(a.category)}</span>`:''}</a>`).join('')
+          + (rows.length > shown.length ? `<div class="muted small" style="padding:8px 2px">Showing ${shown.length} of ${rows.length} — narrow with the search box.</div>` : `<div class="muted small" style="padding:8px 2px">${rows.length} asset${rows.length===1?'':'s'}.</div>`)
+        : `<div class="empty">No assets match this filter.</div>`;
+    }
+    sel.addEventListener('change', render);
+    pick.addEventListener('input', render);
+    render();
+  }catch(e){
+    resultsEl.innerHTML = `<div class="err">Couldn't load the asset register (${esc(e.message)}).</div>`;
+  }
 }
 
 // ---- asset header ----
@@ -174,20 +214,64 @@ function byDateDesc(arr, field){
   return arr.slice().sort((a,b)=> String(b[field]||'').localeCompare(String(a[field]||'')));
 }
 
+// ---- per-asset section state + filtering (status + WO priority) ----
+const SECT = { nc: { rows: null, err: null }, dmt: { rows: null, err: null } };
+
+function activeStatus(){
+  const b = document.querySelector('.fbtn.active');
+  return b ? b.dataset.status : 'all';
+}
+function passStatus(open, status){
+  if(status === 'open')   return open;
+  if(status === 'closed') return !open;
+  return true;
+}
+function paintSection(kind, card, openFn, extraPred, emptyMsg){
+  const listEl = $('#'+kind+'-list'), cntEl = $('#'+kind+'-cnt');
+  if(!listEl) return;
+  const st = SECT[kind];
+  if(st.err){ listEl.innerHTML = `<div class="err">${esc(st.err)}</div>`; if(cntEl) cntEl.textContent = '!'; return; }
+  if(!st.rows) return;                       // still loading — keep the spinner
+  const status = activeStatus();
+  const rows = st.rows.filter(r => passStatus(openFn(r.Status), status) && extraPred(r));
+  if(cntEl) cntEl.textContent = rows.length === st.rows.length ? String(st.rows.length) : `${rows.length}/${st.rows.length}`;
+  listEl.innerHTML = rows.length ? rows.map(card).join('') : `<div class="empty">${emptyMsg}</div>`;
+}
+function applyFilters(){
+  const prio = ($('#prio') || {}).value || '';
+  paintSection('nc', ncCard, ncOpen, () => true, 'No non-conformances match these filters.');
+  paintSection('dmt', dmtCard, dmtOpen, w => !prio || String(w.Priority || '') === prio, 'No DMT work orders match these filters.');
+}
+
 async function loadSection(kind){
   try{
     if(kind === 'nc'){
       const j = await getJSON(`${NC_API}?asset=${encodeURIComponent(ASSET_ID)}&limit=500`);
-      const rows = byDateDesc(j.records || [], 'Date Raised');
-      return { count: rows.length, html: rows.length ? rows.map(ncCard).join('') : `<div class="empty">No non-conformances recorded for this asset.</div>` };
+      SECT.nc = { rows: byDateDesc(j.records || [], 'Date Raised'), err: null };
     } else {
       const j = await getJSON(`${DMT_API}?asset=${encodeURIComponent(ASSET_ID)}&limit=500`);
-      const rows = byDateDesc(j.records || [], 'Date Observed');
-      return { count: rows.length, html: rows.length ? rows.map(dmtCard).join('') : `<div class="empty">No DMT work orders recorded for this asset.</div>` };
+      SECT.dmt = { rows: byDateDesc(j.records || [], 'Date Observed'), err: null };
     }
   }catch(e){
-    return { count: null, html: `<div class="err">Couldn't load this section (${esc(e.message)}). If this persists right after deploy, the API may still need its CORS/redeploy.</div>` };
+    SECT[kind] = { rows: null, err: `Couldn't load this section (${e.message}). If this persists right after deploy, the API may still need its CORS/redeploy.` };
   }
+}
+
+function filterBar(){
+  return `<div class="filterbar">
+    <div class="fgroup" role="group" aria-label="Status">
+      <button class="fbtn active" data-status="all">All</button>
+      <button class="fbtn" data-status="open">Open</button>
+      <button class="fbtn" data-status="closed">Closed</button>
+    </div>
+    <select id="prio" class="sel" aria-label="Work-order priority">
+      <option value="">All priorities</option>
+      <option value="Critical">Critical</option>
+      <option value="High">High</option>
+      <option value="Medium">Medium</option>
+      <option value="Low">Low</option>
+    </select>
+  </div>`;
 }
 
 async function renderAsset(){
@@ -197,15 +281,24 @@ async function renderAsset(){
   const heroHtml = a ? renderHero(a)
     : `<div class="hero"><h1>${esc(ASSET_ID)}</h1><div class="sub err" style="margin-top:8px">This asset ID was not found in the register. Records below are still matched by the exact ID.</div></div>`;
 
-  root.innerHTML = heroHtml +
+  root.innerHTML = heroHtml + filterBar() +
     `<div class="sec"><h2>Non-conformances <span class="cnt" id="nc-cnt">…</span></h2><div id="nc-list"><div class="spin">Loading…</div></div></div>` +
     `<div class="sec"><h2>DMT work orders <span class="cnt" id="dmt-cnt">…</span></h2><div id="dmt-list"><div class="spin">Loading…</div></div></div>`;
 
-  const [nc, dmt] = await Promise.all([ loadSection('nc'), loadSection('dmt') ]);
-  $('#nc-cnt').textContent  = nc.count  == null ? '!' : nc.count;
-  $('#dmt-cnt').textContent = dmt.count == null ? '!' : dmt.count;
-  $('#nc-list').innerHTML  = nc.html;
-  $('#dmt-list').innerHTML = dmt.html;
+  // wire the filter controls
+  document.querySelectorAll('.fbtn').forEach(b => b.addEventListener('click', () => {
+    document.querySelectorAll('.fbtn').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    applyFilters();
+  }));
+  const prioSel = $('#prio'); if(prioSel) prioSel.addEventListener('change', applyFilters);
+
+  // load both sections; paint each as soon as it arrives
+  await Promise.all([
+    loadSection('nc').then(applyFilters),
+    loadSection('dmt').then(applyFilters),
+  ]);
+  applyFilters();
 }
 
 (ASSET_ID ? renderAsset() : renderChooser());
