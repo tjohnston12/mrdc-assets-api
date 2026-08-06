@@ -283,7 +283,7 @@ async function renderAsset(){
   const heroHtml = a ? renderHero(a)
     : `<div class="hero"><h1>${esc(ASSET_ID)}</h1><div class="sub err" style="margin-top:8px">This asset ID was not found in the register. Records below are still matched by the exact ID.</div></div>`;
 
-  root.innerHTML = heroHtml + filterBar() +
+  root.innerHTML = `<div style="margin:0 0 14px"><a href="${location.pathname}" style="text-decoration:none;font-weight:600;font-size:13px;color:var(--blue)">← All assets</a></div>` + heroHtml + filterBar() +
     `<div class="sec"><h2>Non-conformances <span class="cnt" id="nc-cnt">…</span></h2><div id="nc-list"><div class="spin">Loading…</div></div></div>` +
     `<div class="sec"><h2>DMT work orders <span class="cnt" id="dmt-cnt">…</span></h2><div id="dmt-list"><div class="spin">Loading…</div></div></div>`;
 
