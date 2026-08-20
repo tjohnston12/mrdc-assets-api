@@ -237,6 +237,57 @@ async function resolvePhoto(asset, diag) {
   return null;
 }
 
+// ── The typed detail row ────────────────────────────────────────────────────
+// Every asset type has its own detail table holding the fields that only make
+// sense for that type - sign_class, pipe_class, leading_end_type, bulb_watts.
+// None of it was reaching the page. For a single asset we fetch the whole row and
+// hand it over, so the detail view can show everything that is actually recorded.
+const DETAIL_TABLE = {
+  'Sign':               'tblcRZosz76z6g2vk',
+  'Culvert':            'tblDyYac0QWCQtxQv',
+  'Guiderail':          'tblUwHs6Im2OY7Arc',
+  'Barrier Wall':       'tblfDzv7MlCqCDncd',
+  'Wildlife Fence':     'tblW7bcJpCiSYKABl',
+  'Fencing':            'tblW7bcJpCiSYKABl',
+  'Gate':               'tbl5sldKignbSszJV',
+  'Lighting':           'tblrEdE23o4BNtlmM',
+  'Structure':          'tblYM98CKDkmYhB4A',
+  'Drainage Structure': 'tblK2La03BWIjxVB3',
+};
+// Not worth showing: the join keys and the link column. Photo urls are pulled out
+// separately into `photos` so the page can gallery them instead of listing raw urls.
+// asset_ref / source_ref are already in the header - repeating them is noise.
+const DETAIL_SKIP = new Set(['asset_id', 'asset', 'asset_ref', 'source_ref',
+                             'parent_fence', 'parent_fence_asset_id']);
+const isUrlField = k => /_url$|_urls$/.test(k);
+
+async function detailRow(asset) {
+  const table = DETAIL_TABLE[asset.category];
+  if (!table) return null;
+  const qs = new URLSearchParams({
+    maxRecords: '1',
+    filterByFormula: `{asset_id}='${String(asset.id).replace(/'/g, "\\'")}'`,
+  });
+  const j = await airtable(`${table}?${qs}`);
+  const rec = (j.records || [])[0];
+  if (!rec) return null;
+  const fields = {}, photos = [];
+  for (const [k, v] of Object.entries(rec.fields || {})) {
+    if (DETAIL_SKIP.has(k)) continue;
+    if (v == null || v === '' || (Array.isArray(v) && !v.length)) continue;
+    if (isUrlField(k)) {
+      // one field can hold several urls (Structure.attachment_urls is multiline)
+      for (const part of String(v).split(/[\s,]+/)) {
+        const u = usableUrl(part);
+        if (u) photos.push({ label: k, url: u });
+      }
+      continue;
+    }
+    fields[k] = typeof v === 'object' && v.name ? v.name : v;
+  }
+  return { recId: rec.id, table, fields, photos };
+}
+
 // ── Which assets have a photo, in bulk ──────────────────────────────────────
 // resolvePhoto() answers that one asset at a time, which is right for a detail
 // view and useless for "show me everything with no photo". This walks the detail
@@ -379,7 +430,21 @@ module.exports = async function handler(req, res) {
       const diag = wantPhotoDebug ? {} : null;
       let photo = null;
       try { photo = await resolvePhoto(one, diag); } catch (_) { /* photo is best-effort */ }
-      return res.status(200).json({ ...one, photo, ...(diag ? { photoDebug: diag } : {}) });
+      // The typed detail row, so the page can show every recorded field rather than
+      // just location. Best-effort: a failure here must not lose the asset itself.
+      let detail = null;
+      try { detail = await detailRow(one); } catch (_) { /* detail is best-effort */ }
+      const photos = detail ? detail.photos : [];
+      // The hero photo first, then any others, de-duplicated.
+      const gallery = [];
+      for (const u of [photo, ...photos.map(p => p.url)]) if (u && !gallery.includes(u)) gallery.push(u);
+      return res.status(200).json({
+        ...one,
+        photo,
+        photos: gallery,
+        detail: detail ? { recId: detail.recId, table: detail.table, fields: detail.fields } : null,
+        ...(diag ? { photoDebug: diag } : {}),
+      });
     }
 
     res.setHeader('Cache-Control', 'public, max-age=300');
