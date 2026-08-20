@@ -60,6 +60,8 @@ const F = {
   offset:    process.env.ASSET_F_OFFSET    || 'offset',
   status:    process.env.ASSET_F_STATUS    || 'status',
   intersects:process.env.ASSET_F_INTERSECTS|| 'intersecting_roads',
+  editedBy:  process.env.ASSET_F_EDITEDBY  || 'last_edited_by',
+  editedAt:  process.env.ASSET_F_EDITEDAT  || 'last_edited_at',
 };
 
 // cache the register in the warm lambda (assets change rarely)
@@ -332,6 +334,103 @@ const GAPS = [
   { key: 'noRef',       label: 'No asset number',     test: a => !a.asset_ref && !a.source_ref },
 ];
 
+// Every field name that exists on a detail table, so the edit form can offer a
+// field that is currently EMPTY - Airtable omits empty fields from a record, so a
+// single row only tells you what happens to be filled in. Sampled rather than read
+// from the schema API, which would need a scope this token may not have.
+const DETAIL_FIELDS = new Map();   // table -> { at, names }
+async function detailFieldNames(table) {
+  const hit = DETAIL_FIELDS.get(table);
+  if (hit && Date.now() - hit.at < TTL_MS) return hit.names;
+  const names = new Set();
+  let offset, seen = 0;
+  do {
+    const qs = new URLSearchParams({ pageSize: '100' });
+    if (offset) qs.set('offset', offset);
+    const page = await airtable(`${table}?${qs}`);
+    for (const r of page.records || []) {
+      for (const k of Object.keys(r.fields || {})) {
+        if (!DETAIL_LOCKED.has(k) && !isUrlField(k)) names.add(k);
+      }
+      seen++;
+    }
+    offset = page.offset;
+  } while (offset && seen < 300);            // 300 rows is plenty to see every column
+  const list = [...names];
+  DETAIL_FIELDS.set(table, { at: Date.now(), names: list });
+  return list;
+}
+
+// Distinct values already in use for the select-style core fields. Airtable rejects
+// a select value whose choice does not exist, so the edit form offers what is
+// actually valid instead of letting someone type something that will 422.
+function coreChoices(register) {
+  const pick = k => [...new Set(register.map(a => a[k]).filter(Boolean))].sort();
+  return { route: pick('route'), direction: pick('direction'), side: pick('side'), status: pick('status') };
+}
+
+// ── Writing ─────────────────────────────────────────────────────────────────
+// Who may edit. Same shape as the other apps: identity arrives as x-user-* headers
+// set by the page after htra-auth resolves the session.
+//   !! Those headers are SPOOFABLE (working-agreement.md S7). This is a rollout
+//   gate, not a security boundary. It matters more here than elsewhere because the
+//   registry is the key every other app federates on - signed tokens are the real
+//   fix when there is appetite for it.
+function canEdit(req) {
+  const role    = String(req.headers['x-user-role'] || '');
+  const appRole = String(req.headers['x-app-role']  || '');
+  return role === 'Owner' || role === 'Admin' || appRole === 'Admin' || appRole === 'Manager';
+}
+
+// Editable core fields. Identity and provenance are deliberately NOT here:
+//   asset_id    - the foreign key every NC and work order stores as text. Changing
+//                 it silently orphans them. Immutable, by design.
+//   asset_ref / source_ref / source_system / unified_key - provenance back to the
+//                 original record, and the join the photo fallback still uses.
+// Those stay editable in Airtable by someone who understands the consequence.
+const CORE_WRITABLE = new Set([
+  'name', 'description', 'route', 'km_start', 'km_end', 'direction', 'side',
+  'offset', 'lat', 'lng', 'status', 'intersecting_roads', 'division_override',
+]);
+const CORE_NUMERIC = new Set(['km_start', 'km_end', 'lat', 'lng']);
+// On a detail row everything is an attribute of the asset EXCEPT the join key, the
+// link column, and the photo urls (managed by the photo flow, not typed by hand).
+const DETAIL_LOCKED = new Set(['asset_id', 'asset', 'parent_fence', 'parent_fence_asset_id']);
+
+function cleanWrite(input, allow, numeric) {
+  const out = {}, rejected = [];
+  for (const [k, v] of Object.entries(input || {})) {
+    if (allow && !allow.has(k)) { rejected.push(k); continue; }
+    if (!allow && (DETAIL_LOCKED.has(k) || isUrlField(k))) { rejected.push(k); continue; }
+    if (v === '' || v === null) { out[k] = null; continue; }   // an explicit clear
+    if (numeric && numeric.has(k)) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) { rejected.push(k); continue; }
+      out[k] = n;
+      continue;
+    }
+    out[k] = v;
+  }
+  return { fields: out, rejected };
+}
+
+async function airtableWrite(path, method, body) {
+  const res = await fetch(`https://api.airtable.com/v0/${BASE}/${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${PAT}`, 'Content-Type': 'application/json' },
+    // NOTE: returnFieldsByFieldId belongs in the BODY on writes, never the query
+    // string - the trap that broke the patrol app. Not used here at all.
+    body: JSON.stringify(body),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const e = new Error(json.error?.message || json.error?.type || `Airtable ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  return json;
+}
+
 // CORS: allow the platform's own origins (and Vercel previews), not the whole web.
 const ORIGIN_OK = /^https:\/\/([a-z0-9-]+\.)*mrdc-htra\.com$|^https:\/\/[a-z0-9-]+\.vercel\.app$/i;
 function applyCors(req, res) {
@@ -339,13 +438,79 @@ function applyCors(req, res) {
   // server-to-server calls (e.g. DMT intake) send no Origin — nothing to set.
   if (origin && ORIGIN_OK.test(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, PATCH, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-user-role, x-app-role, x-user-id, x-user-name');
+}
+
+async function handlePatch(req, res) {
+  if (!canEdit(req)) return res.status(403).json({ error: 'You do not have edit rights for Assets.' });
+
+  let body = req.body;
+  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (_) { body = null; } }
+  if (!body || !body.id) return res.status(400).json({ error: 'id is required' });
+
+  const actor = String(req.headers['x-user-name'] || '').trim() || 'unknown';
+  const stamp = new Date().toISOString();
+
+  try {
+    // Resolve the asset server-side. The client sends an asset_id, never a record id -
+    // so a tampered payload cannot address a row the user never opened.
+    if (!CACHE.all || Date.now() - CACHE.at >= TTL_MS) {
+      const raw = await fetchAll();
+      CACHE = { at: Date.now(), data: shape(raw, false), all: shape(raw, true) };
+    }
+    const asset = CACHE.all.find(a => a.id === String(body.id));
+    if (!asset) return res.status(404).json({ error: 'Asset not found', id: String(body.id) });
+
+    const core = cleanWrite(body.core, CORE_WRITABLE, CORE_NUMERIC);
+    const det  = cleanWrite(body.detail, null, null);
+    const rejected = [...core.rejected, ...det.rejected];
+    if (!Object.keys(core.fields).length && !Object.keys(det.fields).length) {
+      return res.status(400).json({ error: 'Nothing to update', rejected });
+    }
+
+    // Core row. Always stamp who and when - shared master data needs attribution.
+    if (Object.keys(core.fields).length) {
+      core.fields[F.editedBy] = actor;
+      core.fields[F.editedAt] = stamp;
+      await airtableWrite(`${encodeURIComponent(TABLE)}/${asset.recId}`, 'PATCH', { fields: core.fields });
+    }
+
+    // Detail row, looked up by asset_id rather than trusting a client record id.
+    let detailWritten = 0;
+    if (Object.keys(det.fields).length) {
+      const d = await detailRow(asset);
+      if (!d) return res.status(409).json({ error: 'No detail record exists for this asset yet.', rejected });
+      await airtableWrite(`${d.table}/${d.recId}`, 'PATCH', { fields: det.fields });
+      detailWritten = Object.keys(det.fields).length;
+    }
+
+    CACHE = { at: 0, data: null, all: null };   // the list is now stale - force a rebuild
+    PHOTO_INDEX = { at: 0, ids: null };
+    return res.status(200).json({
+      ok: true,
+      id: asset.id,
+      coreWritten: Object.keys(core.fields).filter(k => k !== F.editedBy && k !== F.editedAt).length,
+      detailWritten,
+      rejected,
+      editedBy: actor,
+      editedAt: stamp,
+    });
+  } catch (e) {
+    console.error('assets PATCH error:', e);
+    const hint = e.status === 403 || e.status === 401
+      ? 'The assets PAT needs data.records:write on ' + BASE + '.'
+      : e.status === 422
+      ? 'Airtable rejected a value - most likely a select option that does not exist yet.'
+      : undefined;
+    return res.status(e.status || 500).json({ error: 'Save failed', detail: e.message, hint });
+  }
 }
 
 module.exports = async function handler(req, res) {
   applyCors(req, res);
   if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method === 'PATCH') return handlePatch(req, res);
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
@@ -438,11 +603,15 @@ module.exports = async function handler(req, res) {
       // The hero photo first, then any others, de-duplicated.
       const gallery = [];
       for (const u of [photo, ...photos.map(p => p.url)]) if (u && !gallery.includes(u)) gallery.push(u);
+      // `available` lets the edit form show fields that are currently empty.
+      let available = [];
+      if (detail) { try { available = await detailFieldNames(detail.table); } catch (_) {} }
       return res.status(200).json({
         ...one,
         photo,
         photos: gallery,
-        detail: detail ? { recId: detail.recId, table: detail.table, fields: detail.fields } : null,
+        detail: detail ? { recId: detail.recId, table: detail.table, fields: detail.fields, available } : null,
+        choices: coreChoices(register),
         ...(diag ? { photoDebug: diag } : {}),
       });
     }
