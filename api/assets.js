@@ -140,16 +140,81 @@ async function airtableIn(base, path) {
   return json;
 }
 // Resolve the asset's photo from the original Asset Database (fresh attachment URL).
-async function resolvePhoto(asset) {
+// ── Photo source 1: the registry's own detail tables (PREFERRED) ────────────
+// Each typed detail table in THIS base carries photo URL text fields. Their
+// contents are of two different kinds and only one is usable:
+//   · Cloudinary  (res.cloudinary.com/...)  — permanent, never expires. 309 culverts.
+//   · Airtable    (v5.airtableusercontent.com/...) — a SIGNED url that EXPIRES
+//     (the 1,018 Sign rows all hold links that lapsed 2026-07-17). Useless.
+// So we take a registry url only when it is NOT an airtableusercontent link, and
+// otherwise fall through to reading the attachment from the original base below.
+// This path stays inside BASE, which the PAT can always read — no cross-base scope
+// needed — so culvert photos work even if the original-base grant is missing.
+const REG_PHOTO = {
+  'Sign':               { table: 'tblcRZosz76z6g2vk', urls: ['photo_url', 'photo_back_url'] },
+  'Culvert':            { table: 'tblDyYac0QWCQtxQv', urls: ['photo_eb_url', 'photo_wb_url', 'photo_median_url'] },
+  'Guiderail':          { table: 'tblUwHs6Im2OY7Arc', urls: ['leading_end_photo_url', 'terminating_end_photo_url'] },
+  'Barrier Wall':       { table: 'tblfDzv7MlCqCDncd', urls: ['photo_url'] },
+  'Wildlife Fence':     { table: 'tblW7bcJpCiSYKABl', urls: ['photo_url'] },
+  'Fencing':            { table: 'tblW7bcJpCiSYKABl', urls: ['photo_url'] },
+  'Gate':               { table: 'tbl5sldKignbSszJV', urls: ['photo_url'] },
+  'Lighting':           { table: 'tblrEdE23o4BNtlmM', urls: ['photo_url'] },
+  'Structure':          { table: 'tblYM98CKDkmYhB4A', urls: ['attachment_urls'] },
+  'Drainage Structure': { table: 'tblK2La03BWIjxVB3', urls: ['photo_url'] },
+};
+// An Airtable-signed url expires, so treat it as absent. attachment_urls is a
+// multiline field, so take the first usable line.
+function usableUrl(v) {
+  if (!v) return null;
+  for (const line of String(v).split(/[\s,]+/)) {
+    const u = line.trim();
+    if (/^https?:\/\//i.test(u) && !/airtableusercontent\.com/i.test(u)) return u;
+  }
+  return null;
+}
+function formulaEq(field, val) {
+  return `{${field}}='${String(val).replace(/'/g, "\\'")}'`;
+}
+async function photoFromRegistry(asset, diag) {
+  const cfg = REG_PHOTO[asset.category];
+  if (!cfg) { if (diag) diag.registry = `no detail table mapped for category "${asset.category}"`; return null; }
+  const qs = new URLSearchParams({ maxRecords: '1', filterByFormula: formulaEq('asset_id', asset.id) });
+  for (const f of cfg.urls) qs.append('fields[]', f);
+  const j = await airtable(`${cfg.table}?${qs}`);
+  const df = (j.records && j.records[0] && j.records[0].fields) || {};
+  if (diag) diag.registry = { table: cfg.table, matched: (j.records || []).length, values: cfg.urls.map(f => df[f] || null) };
+  for (const f of cfg.urls) { const u = usableUrl(df[f]); if (u) return u; }
+  return null;
+}
+
+// ── Photo source 2: a fresh attachment url from the ORIGINAL base (FALLBACK) ──
+async function photoFromOriginal(asset, diag) {
   const cfg = ORIG_PHOTO[asset.category];
-  if (!cfg) return null;
+  if (!cfg) { if (diag) diag.original = `no table mapped for category "${asset.category}"`; return null; }
   const val = cfg.match(asset);
-  if (!val) return null;
-  const qs = new URLSearchParams({ maxRecords: '1', filterByFormula: `{${cfg.key}}='${String(val).replace(/'/g, "\\'")}'` });
+  if (!val) { if (diag) diag.original = 'no source_ref/asset_ref to match on'; return null; }
+  const qs = new URLSearchParams({ maxRecords: '1', filterByFormula: formulaEq(cfg.key, val) });
   for (const f of cfg.photos) qs.append('fields[]', f);
   const j = await airtableIn(ORIG_BASE, `${cfg.table}?${qs}`);
   const df = (j.records && j.records[0] && j.records[0].fields) || {};
+  if (diag) diag.original = { base: ORIG_BASE, table: cfg.table, key: cfg.key, value: val, matched: (j.records || []).length };
   for (const f of cfg.photos) { const u = attUrl(df[f]); if (u) return u; }
+  return null;
+}
+
+// Registry first (permanent Cloudinary links, no cross-base scope needed), then
+// the original base. Each source is independently best-effort: a failure in one
+// must not stop the other from being tried.
+async function resolvePhoto(asset, diag) {
+  try {
+    const u = await photoFromRegistry(asset, diag);
+    if (u) { if (diag) diag.source = 'registry'; return u; }
+  } catch (e) { if (diag) diag.registryError = `${e.status || ''} ${e.message}`.trim(); }
+  try {
+    const u = await photoFromOriginal(asset, diag);
+    if (u) { if (diag) diag.source = 'original'; return u; }
+  } catch (e) { if (diag) diag.originalError = `${e.status || ''} ${e.message}`.trim(); }
+  if (diag && !diag.source) diag.source = null;
   return null;
 }
 
@@ -218,9 +283,13 @@ module.exports = async function handler(req, res) {
       const one = register.find(a => a.id === decodeURIComponent(String(id)));
       res.setHeader('Cache-Control', 'public, max-age=300');
       if (!one) return res.status(404).json({ error: 'Asset not found', id: String(id) });
+      // ?photodebug=1 surfaces WHY a photo is missing (403 vs no match vs empty
+      // field) instead of swallowing it — the errors here are otherwise invisible.
+      const wantPhotoDebug = req.query?.photodebug === '1' || /[?&]photodebug=1/.test(req.url || '');
+      const diag = wantPhotoDebug ? {} : null;
       let photo = null;
-      try { photo = await resolvePhoto(one); } catch (_) { /* photo is best-effort */ }
-      return res.status(200).json({ ...one, photo });
+      try { photo = await resolvePhoto(one, diag); } catch (_) { /* photo is best-effort */ }
+      return res.status(200).json({ ...one, photo, ...(diag ? { photoDebug: diag } : {}) });
     }
 
     res.setHeader('Cache-Control', 'public, max-age=300');
