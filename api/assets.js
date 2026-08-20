@@ -31,6 +31,12 @@ const PAT   = process.env.ASSETS_PAT || process.env.AIRTABLE_PAT;
 const BASE  = process.env.ASSETS_BASE  || 'app0sXrUbOBr7a6vV';
 const TABLE = process.env.ASSETS_TABLE || 'Assets';
 
+// NOTE: these defaults are the ORIGINAL guesses and do NOT match the registry,
+// whose columns are lowercase snake_case (asset_id, name, asset_type, route,
+// km_start...). Production works because every ASSET_F_* is set in Vercel. If one
+// is ever removed the field silently reads as empty rather than erroring - check
+// with ?debug=1, which prints the live column names beside the current map.
+// The review fields added below default to the CORRECT registry names.
 const F = {
   id:       process.env.ASSET_F_ID       || 'Asset ID',
   name:     process.env.ASSET_F_NAME     || 'Name',
@@ -47,6 +53,13 @@ const F = {
   // source_ref / source_system link a registry row back to the ORIGINAL Asset Database
   // record (where the real photo attachments live) — used to resolve a fresh photo.
   sourceRef: process.env.ASSET_F_SOURCEREF || 'source_ref',
+  // Carried for the review view, which exists to show what is MISSING - so it
+  // needs the fields a reviewer would check, not just the mappable ones.
+  direction: process.env.ASSET_F_DIRECTION || 'direction',
+  side:      process.env.ASSET_F_SIDE      || 'side',
+  offset:    process.env.ASSET_F_OFFSET    || 'offset',
+  status:    process.env.ASSET_F_STATUS    || 'status',
+  intersects:process.env.ASSET_F_INTERSECTS|| 'intersecting_roads',
 };
 
 // cache the register in the warm lambda (assets change rarely)
@@ -106,6 +119,12 @@ function shape(records, includeUnmapped) {
     if (km != null) asset.km = km;
     if (f[F.ref] != null && f[F.ref] !== '') asset.asset_ref = String(f[F.ref]);
     if (f[F.sourceRef] != null && f[F.sourceRef] !== '') asset.source_ref = String(f[F.sourceRef]);
+    for (const [key, fld] of [['direction', F.direction], ['side', F.side], ['offset', F.offset],
+                              ['status', F.status], ['intersecting_roads', F.intersects]]) {
+      const v = f[fld];
+      if (v == null || v === '') continue;
+      asset[key] = typeof v === 'object' && v.name ? String(v.name) : String(v);
+    }
     out.push(asset);
   }
   return out;
@@ -218,6 +237,50 @@ async function resolvePhoto(asset, diag) {
   return null;
 }
 
+// ── Which assets have a photo, in bulk ──────────────────────────────────────
+// resolvePhoto() answers that one asset at a time, which is right for a detail
+// view and useless for "show me everything with no photo". This walks the detail
+// tables once and caches the set of asset_ids that have a usable photo URL.
+// Built ONLY for ?audit=1 - it is ~9 extra table scans, so the normal list stays fast.
+let PHOTO_INDEX = { at: 0, ids: null };
+async function photoIndex() {
+  if (PHOTO_INDEX.ids && Date.now() - PHOTO_INDEX.at < TTL_MS) return PHOTO_INDEX.ids;
+  const ids = new Set();
+  const done = new Set();
+  for (const cfg of Object.values(REG_PHOTO)) {
+    const sig = cfg.table + '|' + cfg.urls.join(',');
+    if (done.has(sig)) continue;              // Fencing and Wildlife Fence share a table
+    done.add(sig);
+    let offset;
+    do {
+      const qs = new URLSearchParams({ pageSize: '100' });
+      qs.append('fields[]', 'asset_id');
+      for (const u of cfg.urls) qs.append('fields[]', u);
+      if (offset) qs.set('offset', offset);
+      const page = await airtable(`${cfg.table}?${qs}`);
+      for (const r of page.records || []) {
+        const f = r.fields || {};
+        const id = f.asset_id != null ? String(f.asset_id).trim() : '';
+        if (id && cfg.urls.some(u => usableUrl(f[u]))) ids.add(id);
+      }
+      offset = page.offset;
+    } while (offset);
+  }
+  PHOTO_INDEX = { at: Date.now(), ids };
+  return ids;
+}
+
+// What counts as "missing" for review. Kept here so the page and any future
+// report agree on the definition rather than each inventing their own.
+const GAPS = [
+  { key: 'noCoords',    label: 'No coordinates',      test: a => a.lat == null || a.lng == null },
+  { key: 'noPhoto',     label: 'No photo',            test: a => !a.hasPhoto },
+  { key: 'noRoute',     label: 'No route',            test: a => !a.route },
+  { key: 'noKm',        label: 'No km',               test: a => a.km == null },
+  { key: 'noDirection', label: 'No direction',        test: a => !a.direction },
+  { key: 'noRef',       label: 'No asset number',     test: a => !a.asset_ref && !a.source_ref },
+];
+
 // CORS: allow the platform's own origins (and Vercel previews), not the whole web.
 const ORIGIN_OK = /^https:\/\/([a-z0-9-]+\.)*mrdc-htra\.com$|^https:\/\/[a-z0-9-]+\.vercel\.app$/i;
 function applyCors(req, res) {
@@ -260,6 +323,33 @@ module.exports = async function handler(req, res) {
     // ?all=1 → include assets that have no lat/lng too (for asset pickers, not maps)
     const includeAll = req.query?.all === '1' || /[?&]all=1/.test(req.url || '');
     let register = includeAll ? CACHE.all : CACHE.data;
+
+    // ?audit=1 - the review view. Same register, plus photo presence and a count
+    // of what is missing, per gap and per asset type.
+    const audit = req.query?.audit === '1' || /[?&]audit=1/.test(req.url || '');
+    if (audit) {
+      const withPhoto = await photoIndex();
+      const rows = register.map(a => ({ ...a, hasPhoto: withPhoto.has(a.id) }));
+      const totals = {}, byType = {};
+      for (const g of GAPS) totals[g.key] = 0;
+      for (const a of rows) {
+        const t = a.category || '(blank)';
+        const bt = byType[t] || (byType[t] = { total: 0 });
+        bt.total++;
+        for (const g of GAPS) {
+          if (!g.test(a)) continue;
+          totals[g.key]++;
+          bt[g.key] = (bt[g.key] || 0) + 1;
+        }
+      }
+      res.setHeader('Cache-Control', 'public, max-age=60');
+      return res.status(200).json({
+        total: rows.length,
+        gaps: GAPS.map(g => ({ key: g.key, label: g.label, count: totals[g.key] })),
+        byType,
+        assets: rows,
+      });
+    }
 
     // distinct category (asset_type) values with counts — used to map each OMM
     // standard to the asset type its audit should match against.
