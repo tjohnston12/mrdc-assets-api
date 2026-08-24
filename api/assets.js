@@ -395,7 +395,11 @@ const CORE_WRITABLE = new Set([
 const CORE_NUMERIC = new Set(['km_start', 'km_end', 'lat', 'lng']);
 // On a detail row everything is an attribute of the asset EXCEPT the join key, the
 // link column, and the photo urls (managed by the photo flow, not typed by hand).
-const DETAIL_LOCKED = new Set(['asset_id', 'asset', 'parent_fence', 'parent_fence_asset_id']);
+// asset_ref and source_ref also appear on some detail tables. They are locked on
+// the core record, so leaving them editable here would contradict the note the
+// header shows the user - and they are provenance either way.
+const DETAIL_LOCKED = new Set(['asset_id', 'asset', 'asset_ref', 'source_ref',
+                               'parent_fence', 'parent_fence_asset_id']);
 
 function cleanWrite(input, allow, numeric) {
   const out = {}, rejected = [];
