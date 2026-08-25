@@ -263,15 +263,41 @@ const DETAIL_SKIP = new Set(['asset_id', 'asset', 'asset_ref', 'source_ref',
                              'parent_fence', 'parent_fence_asset_id']);
 const isUrlField = k => /_url$|_urls$/.test(k);
 
+// Does a detail record's link-back-to-Assets column point at this core record?
+// The link column's NAME differs per detail table and is not configured anywhere,
+// so find it by shape: a linked-record cell is an array of record ids (the REST API
+// returns bare strings; some clients return {id,name} objects). Both are handled.
+function linksToRecord(rec, recId) {
+  if (!recId) return false;
+  for (const v of Object.values(rec.fields || {})) {
+    if (!Array.isArray(v)) continue;
+    for (const x of v) {
+      const id = typeof x === 'string' ? x : (x && x.id);
+      if (id === recId) return true;
+    }
+  }
+  return false;
+}
+
+// ⚠️ asset_id is NOT unique - 101 values are shared by more than one record
+// (claude/asset-registry-data-audit.md). Matching a detail row on that text alone
+// returned an arbitrary one, and it could belong to a DIFFERENT asset than the core
+// row being rendered - the page then composited two physical assets into one view.
+// The link column back to Assets IS unique, so it decides. When the text matches
+// several rows and none of them link here, show NOTHING rather than the wrong asset.
 async function detailRow(asset) {
   const table = DETAIL_TABLE[asset.category];
   if (!table) return null;
   const qs = new URLSearchParams({
-    maxRecords: '1',
+    pageSize: '25',
     filterByFormula: `{asset_id}='${String(asset.id).replace(/'/g, "\\'")}'`,
   });
   const j = await airtable(`${table}?${qs}`);
-  const rec = (j.records || [])[0];
+  const recs = j.records || [];
+  if (!recs.length) return null;
+  const linked = recs.find(r => linksToRecord(r, asset.recId));
+  // One text match and no link to contradict it is still trustworthy.
+  const rec = linked || (recs.length === 1 ? recs[0] : null);
   if (!rec) return null;
   const fields = {}, photos = [];
   for (const [k, v] of Object.entries(rec.fields || {})) {
@@ -328,10 +354,25 @@ async function photoIndex() {
 const GAPS = [
   { key: 'noCoords',    label: 'No coordinates',      test: a => a.lat == null || a.lng == null },
   { key: 'noPhoto',     label: 'No photo',            test: a => !a.hasPhoto },
-  { key: 'noRoute',     label: 'No route',            test: a => !a.route },
+  // ⚠️ Route and intersecting road are ALTERNATIVES, not both-required. An asset is
+  // located either by a contract route (Routes 1/2/7/8, with a km) or by the road it
+  // crosses — assets off the contract routes only ever have the latter. So a blank
+  // route is only a gap when there is no intersecting road either; only BOTH blank
+  // means nobody knows where the thing is.
+  // Troy, 2026-08-25: "if an asset has an intersecting road listed, then not having
+  // a route number is acceptable so do not list as having no route."
+  { key: 'noRoute',     label: 'No route',            test: a => !a.route && !a.intersecting_roads },
   { key: 'noKm',        label: 'No km',               test: a => a.km == null },
   { key: 'noDirection', label: 'No direction',        test: a => !a.direction },
   { key: 'noRef',       label: 'No asset number',     test: a => !a.asset_ref && !a.source_ref },
+  // ⚠️ Not a missing FIELD — a broken IDENTITY. Several records carry this asset_id,
+  // so the register cannot say which physical asset is meant. Every app federates on
+  // asset_id, so until these are distinguished, a work order or NC pointing at one of
+  // them points at all of them. Troy, 2026-08-25: "set them aside in a new bucket
+  // labeled needs review".
+  // `dupCount` is stamped on each row by the audit branch — it needs the whole
+  // register, which a per-asset test cannot see.
+  { key: 'needsReview', label: 'Needs review',        test: a => (a.dupCount || 1) > 1 },
 ];
 
 // Every field name that exists on a detail table, so the edit form can offer a
@@ -451,20 +492,38 @@ async function handlePatch(req, res) {
 
   let body = req.body;
   if (typeof body === 'string') { try { body = JSON.parse(body); } catch (_) { body = null; } }
-  if (!body || !body.id) return res.status(400).json({ error: 'id is required' });
+  if (!body || (!body.rec && !body.id)) return res.status(400).json({ error: 'rec (or id) is required' });
 
   const actor = String(req.headers['x-user-name'] || '').trim() || 'unknown';
   const stamp = new Date().toISOString();
 
   try {
-    // Resolve the asset server-side. The client sends an asset_id, never a record id -
-    // so a tampered payload cannot address a row the user never opened.
+    // Resolve the asset server-side, against the register - never by writing to a
+    // record id straight off the wire. A record id that is not in the register is
+    // refused, so a tampered payload still cannot address an arbitrary Airtable row.
+    //
+    // ⚠️ It used to resolve on body.id (an asset_id) on the theory that withholding
+    // record ids was safer. It was not - the register is readable, so a record id is
+    // no more secret than an asset_id - and because asset_id is NOT unique, every
+    // save against a shared id landed on whichever record came first. Troy edited a
+    // barrier wall three times and all three edits went to a different wall.
     if (!CACHE.all || Date.now() - CACHE.at >= TTL_MS) {
       const raw = await fetchAll();
       CACHE = { at: Date.now(), data: shape(raw, false), all: shape(raw, true) };
     }
-    const asset = CACHE.all.find(a => a.id === String(body.id));
-    if (!asset) return res.status(404).json({ error: 'Asset not found', id: String(body.id) });
+    const asset = body.rec
+      ? CACHE.all.find(a => a.recId === String(body.rec))
+      : CACHE.all.find(a => a.id === String(body.id));
+    if (!asset) return res.status(404).json({ error: 'Asset not found', id: String(body.rec || body.id) });
+    // Refuse an ambiguous save outright. Writing to "probably the right one" is how
+    // the data got into this state; the caller must name the record.
+    if (!body.rec && CACHE.all.filter(a => a.id === asset.id).length > 1) {
+      return res.status(409).json({
+        error: 'Several records share this asset ID. Re-open the asset and save again so the exact record is named.',
+        assetId: asset.id,
+        records: CACHE.all.filter(a => a.id === asset.id).map(a => ({ recId: a.recId, name: a.name })),
+      });
+    }
 
     const core = cleanWrite(body.core, CORE_WRITABLE, CORE_NUMERIC);
     const det  = cleanWrite(body.detail, null, null);
@@ -494,6 +553,7 @@ async function handlePatch(req, res) {
     return res.status(200).json({
       ok: true,
       id: asset.id,
+      rec: asset.recId,
       coreWritten: Object.keys(core.fields).filter(k => k !== F.editedBy && k !== F.editedAt).length,
       detailWritten,
       rejected,
@@ -511,6 +571,8 @@ async function handlePatch(req, res) {
   }
 }
 
+// Exported for tests: the gap definitions are the one thing the page, this API and
+// any future report all have to agree on.
 module.exports = async function handler(req, res) {
   applyCors(req, res);
   if (req.method === 'OPTIONS') return res.status(200).end();
@@ -549,7 +611,13 @@ module.exports = async function handler(req, res) {
     const audit = req.query?.audit === '1' || /[?&]audit=1/.test(req.url || '');
     if (audit) {
       const withPhoto = await photoIndex();
-      const rows = register.map(a => ({ ...a, hasPhoto: withPhoto.has(a.id) }));
+      // How many records share each asset_id. Counted once, over the whole register,
+      // then stamped on every row so the gap tests stay per-asset.
+      const idCount = new Map();
+      for (const a of register) idCount.set(a.id, (idCount.get(a.id) || 0) + 1);
+      const rows = register.map(a => ({
+        ...a, hasPhoto: withPhoto.has(a.id), dupCount: idCount.get(a.id) || 1,
+      }));
       const totals = {}, byType = {};
       for (const g of GAPS) totals[g.key] = 0;
       for (const a of rows) {
@@ -588,17 +656,37 @@ module.exports = async function handler(req, res) {
 
     // single-asset lookup by id — what DMT intake calls to resolve route/km/lat/lng,
     // and what the Asset 360 page calls (it also wants a photo).
-    const id = req.query?.id || (req.url.match(/[?&]id=([^&]+)/) || [])[1];
-    if (id) {
-      const one = register.find(a => a.id === decodeURIComponent(String(id)));
+    // ?rec=recXXXXXXXXXXXXXX - the ONLY unambiguous way to address an asset.
+    // ?id= is kept for links made before this existed and for other apps, but
+    // asset_id is not unique, so it can only ever return the first match.
+    const rec = req.query?.rec || (req.url.match(/[?&]rec=([^&]+)/) || [])[1];
+    const id  = req.query?.id  || (req.url.match(/[?&]id=([^&]+)/)  || [])[1];
+    if (rec || id) {
+      const wantRec = rec ? decodeURIComponent(String(rec)) : null;
+      const wantId  = id  ? decodeURIComponent(String(id))  : null;
+      const one = wantRec
+        ? register.find(a => a.recId === wantRec)
+        : register.find(a => a.id === wantId);
       res.setHeader('Cache-Control', 'public, max-age=300');
-      if (!one) return res.status(404).json({ error: 'Asset not found', id: String(id) });
+      if (!one) return res.status(404).json({ error: 'Asset not found', id: String(rec || id) });
+      // Every record sharing this asset_id, so the page can say so out loud instead
+      // of silently showing one of several. Always computed from the asset actually
+      // resolved - addressing by rec must still reveal that it has siblings.
+      const shared = register.filter(a => a.id === one.id);
+      const duplicates = shared.length > 1
+        ? shared.map(a => ({ recId: a.recId, name: a.name, route: a.route || null }))
+        : null;
       // ?photodebug=1 surfaces WHY a photo is missing (403 vs no match vs empty
       // field) instead of swallowing it — the errors here are otherwise invisible.
       const wantPhotoDebug = req.query?.photodebug === '1' || /[?&]photodebug=1/.test(req.url || '');
       const diag = wantPhotoDebug ? {} : null;
       let photo = null;
-      try { photo = await resolvePhoto(one, diag); } catch (_) { /* photo is best-effort */ }
+      // The hero photo is matched in the ORIGINAL base, where there is no link column
+      // to disambiguate with - so on a shared asset_id it can only guess. Skip it and
+      // let the detail row's own photo_url speak, which IS record-specific.
+      if (!duplicates) {
+        try { photo = await resolvePhoto(one, diag); } catch (_) { /* photo is best-effort */ }
+      }
       // The typed detail row, so the page can show every recorded field rather than
       // just location. Best-effort: a failure here must not lose the asset itself.
       let detail = null;
@@ -616,6 +704,7 @@ module.exports = async function handler(req, res) {
         photos: gallery,
         detail: detail ? { recId: detail.recId, table: detail.table, fields: detail.fields, available } : null,
         choices: coreChoices(register),
+        ...(duplicates ? { duplicates } : {}),
         ...(diag ? { photoDebug: diag } : {}),
       });
     }
@@ -633,3 +722,5 @@ module.exports = async function handler(req, res) {
     return res.status(e.status || 500).json({ error: 'Failed to load assets', detail: e.message, hint });
   }
 };
+
+module.exports.__test = { GAPS, linksToRecord };
