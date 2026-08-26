@@ -429,6 +429,16 @@ function canEdit(req) {
 //   asset_ref / source_ref / source_system / unified_key - provenance back to the
 //                 original record, and the join the photo fallback still uses.
 // Those stay editable in Airtable by someone who understands the consequence.
+// Creating an asset is NARROWER than editing one. Editing is Owner / org Admin /
+// Assets Admin / Assets Manager; creating is Owner / org Admin / Assets Admin only
+// (Troy, 2026-08-26: "an add asset button ... for owner and admin only"). A Manager
+// can still correct an asset that exists — they just cannot mint a new federation key.
+function canCreate(req) {
+  const role    = String(req.headers['x-user-role'] || '');
+  const appRole = String(req.headers['x-app-role']  || '');
+  return role === 'Owner' || role === 'Admin' || appRole === 'Admin';
+}
+
 const CORE_WRITABLE = new Set([
   'name', 'description', 'route', 'km_start', 'km_end', 'direction', 'side',
   'offset', 'lat', 'lng', 'status', 'intersecting_roads', 'division_override',
@@ -485,6 +495,113 @@ function applyCors(req, res) {
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET, PATCH, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-user-role, x-app-role, x-user-id, x-user-name');
+}
+
+// ── Creating an asset ───────────────────────────────────────────────────────
+// The one place a new federation key enters the register, so the guards here matter
+// more than anywhere else in this file:
+//   · asset_id is REQUIRED and must be UNIQUE. 101 ids are currently shared by more
+//     than one record and the consequences filled a working day
+//     (claude/assets-record-id-addressing.md) — nothing new is allowed to join them.
+//   · asset_type is REQUIRED, because it decides which typed detail table the asset
+//     belongs to, and an asset with no detail row has nowhere to keep a photo.
+//   · source_ref / source_system are NOT writable. They mean "this came from the old
+//     Asset Database", which is false for anything created here. asset_ref IS
+//     writable — that is the human asset number, and a new asset legitimately has one.
+const CREATE_WRITABLE = new Set([...CORE_WRITABLE, 'asset_id', 'asset_type', 'asset_ref',
+                                 'tagged_marked', 'tag_marking']);
+
+async function handleCreate(req, res) {
+  if (!canCreate(req)) {
+    return res.status(403).json({ error: 'Only an Owner or an Admin can add an asset.' });
+  }
+  let body = req.body;
+  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (_) { body = null; } }
+  const core = (body && body.core) || null;
+  if (!core) return res.status(400).json({ error: 'core is required' });
+
+  const assetId = String(core.asset_id == null ? '' : core.asset_id).trim();
+  const type    = String(core.asset_type == null ? '' : core.asset_type).trim();
+  if (!assetId) return res.status(400).json({ error: 'An asset ID is required.' });
+  if (!type)    return res.status(400).json({ error: 'An asset type is required.' });
+  if (!DETAIL_TABLE[type]) {
+    return res.status(400).json({
+      error: `"${type}" is not a known asset type.`,
+      types: Object.keys(DETAIL_TABLE),
+    });
+  }
+
+  const actor = String(req.headers['x-user-name'] || '').trim() || 'unknown';
+  const stamp = new Date().toISOString();
+
+  try {
+    // Read the register fresh. A cached copy could be up to 5 minutes stale, and a
+    // stale uniqueness check is the same as no uniqueness check.
+    const raw = await fetchAll();
+    CACHE = { at: Date.now(), data: shape(raw, false), all: shape(raw, true) };
+    const clash = CACHE.all.filter(a => a.id === assetId);
+    if (clash.length) {
+      return res.status(409).json({
+        error: 'That asset ID is already in use.',
+        assetId,
+        existing: clash.map(a => ({ recId: a.recId, name: a.name, category: a.category })),
+      });
+    }
+
+    // Shaped exactly like handlePatch: cleanWrite's keys ARE the Airtable column
+    // names (verified live - lat, lng, name, asset_type, km_start all resolve), so
+    // they pass straight through. Only the three the caller must not spoof are set
+    // from the validated values.
+    const clean = cleanWrite(core, CREATE_WRITABLE, CORE_NUMERIC);
+    const fields = { ...clean.fields };
+    delete fields.asset_id; delete fields.asset_type;
+    fields[F.id] = assetId;
+    fields[F.category] = type;
+    fields[F.editedBy] = actor;
+    fields[F.editedAt] = stamp;
+
+    const created = await airtableWrite(encodeURIComponent(TABLE), 'POST',
+      { records: [{ fields }] });
+    const rec = (created.records || [])[0];
+    if (!rec) throw new Error('Airtable accepted the asset but returned no record.');
+
+    // The typed detail row, linked back properly. Every detail table uses the same
+    // two column names — `asset_id` for the text key and `asset` for the link —
+    // verified across all nine on 2026-08-26.
+    let detailRec = null, detailError = null;
+    try {
+      const d = await airtableWrite(encodeURIComponent(DETAIL_TABLE[type]), 'POST',
+        { records: [{ fields: { asset_id: assetId, asset: [rec.id] } }] });
+      detailRec = ((d.records || [])[0] || {}).id || null;
+    } catch (e) {
+      // The asset itself is created and correct; a missing detail row is recoverable
+      // and must not read as "the asset was not created".
+      detailError = e.message;
+    }
+
+    CACHE = { at: 0, data: null, all: null };
+    PHOTO_INDEX = { at: 0, ids: null };
+    return res.status(201).json({
+      ok: true,
+      recId: rec.id,
+      id: assetId,
+      category: type,
+      detailRec,
+      detailTable: DETAIL_TABLE[type],
+      ...(detailError ? { detailError } : {}),
+      rejected: clean.rejected,
+      createdBy: actor,
+      createdAt: stamp,
+    });
+  } catch (e) {
+    console.error('assets POST error:', e);
+    const hint = e.status === 403 || e.status === 401
+      ? 'The assets PAT needs data.records:write on ' + BASE + '.'
+      : e.status === 422
+      ? 'Airtable rejected a value - most likely a select option that does not exist yet.'
+      : undefined;
+    return res.status(e.status || 500).json({ error: 'Create failed', detail: e.message, hint });
+  }
 }
 
 async function handlePatch(req, res) {
@@ -577,6 +694,7 @@ module.exports = async function handler(req, res) {
   applyCors(req, res);
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method === 'PATCH') return handlePatch(req, res);
+  if (req.method === 'POST')  return handleCreate(req, res);
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
