@@ -62,6 +62,11 @@ const F = {
   intersects:process.env.ASSET_F_INTERSECTS|| 'intersecting_roads',
   editedBy:  process.env.ASSET_F_EDITEDBY  || 'last_edited_by',
   editedAt:  process.env.ASSET_F_EDITEDAT  || 'last_edited_at',
+  // Where on the highway the thing sits - main lane, a ramp, the gore, the median.
+  // The old base recorded this in SEVEN different columns depending on asset type;
+  // claude/assets-roadway-element.md. ⚠️ BLANK MEANS NOT ASSESSED, not main lane.
+  roadway:   process.env.ASSET_F_ROADWAY   || 'roadway_element',
+  rampRef:   process.env.ASSET_F_RAMPREF   || 'ramp_ref',
 };
 
 // cache the register in the warm lambda (assets change rarely)
@@ -122,7 +127,8 @@ function shape(records, includeUnmapped) {
     if (f[F.ref] != null && f[F.ref] !== '') asset.asset_ref = String(f[F.ref]);
     if (f[F.sourceRef] != null && f[F.sourceRef] !== '') asset.source_ref = String(f[F.sourceRef]);
     for (const [key, fld] of [['direction', F.direction], ['side', F.side], ['offset', F.offset],
-                              ['status', F.status], ['intersecting_roads', F.intersects]]) {
+                              ['status', F.status], ['intersecting_roads', F.intersects],
+                              ['roadway_element', F.roadway], ['ramp_ref', F.rampRef]]) {
       const v = f[fld];
       if (v == null || v === '') continue;
       asset[key] = typeof v === 'object' && v.name ? String(v.name) : String(v);
@@ -405,9 +411,22 @@ async function detailFieldNames(table) {
 // Distinct values already in use for the select-style core fields. Airtable rejects
 // a select value whose choice does not exist, so the edit form offers what is
 // actually valid instead of letting someone type something that will 422.
+// ⚠️ roadway_element's options are NOT derived from the data the way the others are.
+// Only 4 of its 8 values occur in the register today, so `pick()` would offer a
+// dropdown that can never reach Main lane, Gore, Median or Crossover - the values a
+// person is most likely to want to set by hand. The list is stated here instead and
+// MUST match the Airtable single-select. Adding a NEW choice is a schema change and
+// therefore Troy's click, not this file's (working-agreement.md).
+const ROADWAY_ELEMENTS = ['Main lane', 'On ramp', 'Off ramp', 'On and off ramp',
+                          'Ramp - on/off not stated', 'Gore', 'Median', 'Crossover'];
+
 function coreChoices(register) {
   const pick = k => [...new Set(register.map(a => a[k]).filter(Boolean))].sort();
-  return { route: pick('route'), direction: pick('direction'), side: pick('side'), status: pick('status') };
+  // A value already on a record but missing from the list above still has to be
+  // selectable, or opening the editor would silently offer to clear it.
+  const roadway = [...new Set([...ROADWAY_ELEMENTS, ...pick('roadway_element')])];
+  return { route: pick('route'), direction: pick('direction'), side: pick('side'),
+           status: pick('status'), roadway_element: roadway };
 }
 
 // ── Writing ─────────────────────────────────────────────────────────────────
@@ -442,6 +461,7 @@ function canCreate(req) {
 const CORE_WRITABLE = new Set([
   'name', 'description', 'route', 'km_start', 'km_end', 'direction', 'side',
   'offset', 'lat', 'lng', 'status', 'intersecting_roads', 'division_override',
+  'roadway_element', 'ramp_ref',
 ]);
 const CORE_NUMERIC = new Set(['km_start', 'km_end', 'lat', 'lng']);
 // On a detail row everything is an attribute of the asset EXCEPT the join key, the
