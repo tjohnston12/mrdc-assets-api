@@ -464,19 +464,51 @@ const CORE_WRITABLE = new Set([
   'roadway_element', 'ramp_ref',
 ]);
 const CORE_NUMERIC = new Set(['km_start', 'km_end', 'lat', 'lng']);
+
+// Troy, 2026-08-27: "when an admin is editing an asset or adding an asset they need to
+// be able to edit all fields, including changing the asset name if necessary."
+//
+// These are the fields a MANAGER may not touch but an ADMIN may. They are provenance,
+// not identity, so nothing downstream resolves through them:
+//   · asset_ref  - the human asset number ("1-C40b"). Nothing federates on it, and it
+//                  is already writable when CREATING an asset, so locking it on edit
+//                  was an inconsistency rather than a safeguard.
+//   · source_ref / source_system - where the row came from in the old Asset Database.
+//     ⚠️ resolvePhoto() matches the old base on source_ref, so changing it can cost
+//     that asset its hero photo until the detail row's own photo_url is set. Recoverable,
+//     and worth it for an admin correcting a bad provenance value.
+//
+// ⚠️ asset_id and asset_type are NOT here. Both are still refused, and deliberately -
+// see the note on handlePatch. They are identity and structure, not description.
+const ADMIN_WRITABLE = new Set(['asset_ref', 'source_ref', 'source_system']);
+function canAdmin(req) {
+  const role    = String(req.headers['x-user-role'] || '');
+  const appRole = String(req.headers['x-app-role']  || '');
+  return role === 'Owner' || role === 'Admin' || appRole === 'Admin';
+}
 // On a detail row everything is an attribute of the asset EXCEPT the join key, the
 // link column, and the photo urls (managed by the photo flow, not typed by hand).
 // asset_ref and source_ref also appear on some detail tables. They are locked on
 // the core record, so leaving them editable here would contradict the note the
 // header shows the user - and they are provenance either way.
+// ⚠️ `asset_id` and `asset` stay locked for EVERYONE, admin included. They are not
+// data about the asset - they are the join that makes the row belong to it. Editing
+// either detaches the detail row from its asset, which is a corruption, not a change.
+const DETAIL_JOIN_KEYS = new Set(['asset_id', 'asset']);
 const DETAIL_LOCKED = new Set(['asset_id', 'asset', 'asset_ref', 'source_ref',
                                'parent_fence', 'parent_fence_asset_id']);
 
-function cleanWrite(input, allow, numeric) {
+// `admin` relaxes the DETAIL side: an admin may correct a detail row's asset_ref /
+// source_ref and may type a photo URL by hand. The join keys are never relaxed.
+function cleanWrite(input, allow, numeric, admin) {
   const out = {}, rejected = [];
   for (const [k, v] of Object.entries(input || {})) {
     if (allow && !allow.has(k)) { rejected.push(k); continue; }
-    if (!allow && (DETAIL_LOCKED.has(k) || isUrlField(k))) { rejected.push(k); continue; }
+    if (!allow) {
+      const blocked = admin ? DETAIL_JOIN_KEYS.has(k)
+                            : (DETAIL_LOCKED.has(k) || isUrlField(k));
+      if (blocked) { rejected.push(k); continue; }
+    }
     if (v === '' || v === null) { out[k] = null; continue; }   // an explicit clear
     if (numeric && numeric.has(k)) {
       const n = Number(v);
@@ -572,7 +604,7 @@ async function handleCreate(req, res) {
     // names (verified live - lat, lng, name, asset_type, km_start all resolve), so
     // they pass straight through. Only the three the caller must not spoof are set
     // from the validated values.
-    const clean = cleanWrite(core, CREATE_WRITABLE, CORE_NUMERIC);
+    const clean = cleanWrite(core, CREATE_WRITABLE, CORE_NUMERIC, true);
     const fields = { ...clean.fields };
     delete fields.asset_id; delete fields.asset_type;
     fields[F.id] = assetId;
@@ -588,10 +620,16 @@ async function handleCreate(req, res) {
     // The typed detail row, linked back properly. Every detail table uses the same
     // two column names — `asset_id` for the text key and `asset` for the link —
     // verified across all nine on 2026-08-26.
+    // ⚠️ The detail row used to be created EMPTY, so "add an asset" could not record a
+    // culvert's diameter or a sign's class at the moment someone had them in front of
+    // them - they had to save, reopen and edit. Troy, 2026-08-27: an admin adding an
+    // asset needs all the fields. The join keys are still set here and never taken from
+    // the caller.
     let detailRec = null, detailError = null;
+    const detIn = cleanWrite(body && body.detail, null, null, true);
     try {
       const d = await airtableWrite(encodeURIComponent(DETAIL_TABLE[type]), 'POST',
-        { records: [{ fields: { asset_id: assetId, asset: [rec.id] } }] });
+        { records: [{ fields: { ...detIn.fields, asset_id: assetId, asset: [rec.id] } }] });
       detailRec = ((d.records || [])[0] || {}).id || null;
     } catch (e) {
       // The asset itself is created and correct; a missing detail row is recoverable
@@ -662,8 +700,10 @@ async function handlePatch(req, res) {
       });
     }
 
-    const core = cleanWrite(body.core, CORE_WRITABLE, CORE_NUMERIC);
-    const det  = cleanWrite(body.detail, null, null);
+    const admin = canAdmin(req);
+    const allow = admin ? new Set([...CORE_WRITABLE, ...ADMIN_WRITABLE]) : CORE_WRITABLE;
+    const core = cleanWrite(body.core, allow, CORE_NUMERIC, admin);
+    const det  = cleanWrite(body.detail, null, null, admin);
     const rejected = [...core.rejected, ...det.rejected];
     if (!Object.keys(core.fields).length && !Object.keys(det.fields).length) {
       return res.status(400).json({ error: 'Nothing to update', rejected });
@@ -777,6 +817,20 @@ module.exports = async function handler(req, res) {
       });
     }
 
+    // ?detailfields=<asset type> - the column list of that type's detail table, so the
+    // ADD form can offer the same fields the edit form does. Without it the create form
+    // has nothing to render: a brand-new asset has no detail row to read a shape from.
+    const dfType = req.query?.detailfields || (/[?&]detailfields=([^&]+)/.exec(req.url || '') || [])[1];
+    if (dfType) {
+      const type = decodeURIComponent(String(dfType));
+      const table = DETAIL_TABLE[type];
+      if (!table) return res.status(400).json({ error: `"${type}" is not a known asset type.`, types: Object.keys(DETAIL_TABLE) });
+      let names = [];
+      try { names = await detailFieldNames(table); } catch (_) { names = []; }
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      return res.status(200).json({ type, table, fields: names });
+    }
+
     // distinct category (asset_type) values with counts — used to map each OMM
     // standard to the asset type its audit should match against.
     const types = req.query?.types === '1' || /[?&]types=1/.test(req.url || '');
@@ -799,13 +853,35 @@ module.exports = async function handler(req, res) {
     // asset_id is not unique, so it can only ever return the first match.
     const rec = req.query?.rec || (req.url.match(/[?&]rec=([^&]+)/) || [])[1];
     const id  = req.query?.id  || (req.url.match(/[?&]id=([^&]+)/)  || [])[1];
+    // ⚠️ ?fresh=1 - read this record straight from Airtable, bypassing every cache.
+    //
+    // Saving an edit and seeing the OLD values come back had TWO causes, and fixing
+    // only one would have left the bug intermittent:
+    //   1. This response used to be `Cache-Control: public, max-age=300`, so the
+    //      BROWSER served the pre-edit body for five minutes.
+    //   2. `CACHE` is per-lambda-instance memory. handlePatch clears it in the
+    //      instance that handled the PATCH; the GET that follows can land on a
+    //      DIFFERENT warm instance still holding a five-minute-old register. No
+    //      cache header fixes that one.
+    // Troy, 2026-08-27: "after I save changes have the screen refresh to reflect those
+    // changes, currently it does not."
+    const fresh = req.query?.fresh === '1' || /[?&]fresh=1/.test(req.url || '');
     if (rec || id) {
       const wantRec = rec ? decodeURIComponent(String(rec)) : null;
       const wantId  = id  ? decodeURIComponent(String(id))  : null;
-      const one = wantRec
+      let one = wantRec
         ? register.find(a => a.recId === wantRec)
         : register.find(a => a.id === wantId);
-      res.setHeader('Cache-Control', 'public, max-age=300');
+      // A record read costs one API call, against ~44 to rebuild the whole register,
+      // so freshness is cheap when the caller names the record.
+      if (fresh && wantRec) {
+        try {
+          const live = await airtable(`${encodeURIComponent(TABLE)}/${encodeURIComponent(wantRec)}`);
+          const shaped = shape([live], true)[0];
+          if (shaped) one = shaped;
+        } catch (_) { /* fall back to the cached row rather than 404 a record that exists */ }
+      }
+      res.setHeader('Cache-Control', fresh ? 'no-store' : 'public, max-age=300');
       if (!one) return res.status(404).json({ error: 'Asset not found', id: String(rec || id) });
       // Every record sharing this asset_id, so the page can say so out loud instead
       // of silently showing one of several. Always computed from the asset actually
