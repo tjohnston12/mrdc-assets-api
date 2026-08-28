@@ -269,6 +269,42 @@ const DETAIL_SKIP = new Set(['asset_id', 'asset', 'asset_ref', 'source_ref',
                              'parent_fence', 'parent_fence_asset_id']);
 const isUrlField = k => /_url$|_urls$/.test(k);
 
+// ⚠️ 2026-08-28: two new Guiderail assets were created with NO detail row at all -
+// not just a missing photo, every detail field. Root cause: detailFieldNames() only
+// samples column NAMES from real rows (the schema API needs a scope this token may
+// not have), so the ADD form's detail inputs are all plain text - and a detail write
+// carries no `numeric` set the way the core write does, and airtableWrite never sets
+// typecast. Airtable's API is strict without typecast: a Number column rejects a
+// string, a checkbox column rejects anything but a real boolean, and Airtable
+// creates the record ATOMICALLY - one bad field fails the WHOLE row, which is why
+// the successfully-uploaded photo URL was lost along with everything else and the
+// create still returned 201 (the CORE asset row is a separate write and had
+// already succeeded).
+//
+// Fixed by coercing the fields this app already knows are numeric/checkbox, per
+// type - hand-maintained here rather than solved with Airtable's typecast, which
+// would also silently invent new select options from a typo (e.g. Guiderail's
+// `ramp` field). Keep in step with the live schema if a detail table's columns
+// change - verified against list_tables_for_base on 2026-08-28.
+const DETAIL_NUMERIC = {
+  'Guiderail':          ['no_of_rail', 'length_m'],
+  'Barrier Wall':       ['delineator'],
+  'Wildlife Fence':     ['year_installed'],
+  'Fencing':            ['year_installed'],
+  'Gate':               ['year_installed'],
+  'Sign':               ['no_of_posts', 'width_ft', 'height_ft', 'area_m2', 'year_manufactured', 'year_installed'],
+  'Lighting':           ['lights_per_pole', 'mounting_height_m', 'bolt_spacing_mm', 'year_installed', 'year_updated'],
+  'Structure':          ['year_built', 'total_length_m', 'total_width_m'],
+  'Drainage Structure': ['dimensions_mm'],
+};
+const DETAIL_CHECKBOX = {
+  'Culvert':            ['twin_flag'],
+  'Wildlife Fence':     ['wildlife_gate', 'man_gate', 'deer_passage', 'terminates_at_structure'],
+  'Fencing':            ['wildlife_gate', 'man_gate', 'deer_passage', 'terminates_at_structure'],
+  'Gate':               ['at_culvert', 'at_structure', 'deer_passage'],
+  'Sign':               ['is_km_marker'],
+};
+
 // Does a detail record's link-back-to-Assets column point at this core record?
 // The link column's NAME differs per detail table and is not configured anywhere,
 // so find it by shape: a linked-record cell is an array of record ids (the REST API
@@ -500,20 +536,37 @@ const DETAIL_LOCKED = new Set(['asset_id', 'asset', 'asset_ref', 'source_ref',
 
 // `admin` relaxes the DETAIL side: an admin may correct a detail row's asset_ref /
 // source_ref and may type a photo URL by hand. The join keys are never relaxed.
-function cleanWrite(input, allow, numeric, admin) {
+//
+// `photoAllow` is narrower and not admin-gated: it names the SPECIFIC field(s) this
+// asset's type actually uses for a photo (REG_PHOTO[type].urls), so anyone who can
+// edit the asset at all can use the app's own upload control to add or replace a
+// photo - "managed by the photo flow, not typed by hand" (see below) meant the URL
+// itself is never hand-typed, not that only an admin may use the flow. Every other
+// URL-shaped field (e.g. Structure's master_record_url) stays admin-only.
+function cleanWrite(input, allow, numeric, admin, checkbox, photoAllow) {
   const out = {}, rejected = [];
   for (const [k, v] of Object.entries(input || {})) {
     if (allow && !allow.has(k)) { rejected.push(k); continue; }
     if (!allow) {
       const blocked = admin ? DETAIL_JOIN_KEYS.has(k)
-                            : (DETAIL_LOCKED.has(k) || isUrlField(k));
+                            : (DETAIL_LOCKED.has(k) || (isUrlField(k) && !(photoAllow && photoAllow.has(k))));
       if (blocked) { rejected.push(k); continue; }
     }
     if (v === '' || v === null) { out[k] = null; continue; }   // an explicit clear
     if (numeric && numeric.has(k)) {
       const n = Number(v);
+      // Reject just this one field rather than letting Airtable's strict typing
+      // fail the whole record - a single bad number must not cost the rest of a
+      // detail row (or its photo) the way it did on 2026-08-28.
       if (!Number.isFinite(n)) { rejected.push(k); continue; }
       out[k] = n;
+      continue;
+    }
+    // Checkbox columns are equally strict - Airtable wants an actual boolean, not
+    // any of the text a plain input can send (the create form has no way yet to
+    // render these as real checkboxes; see DETAIL_CHECKBOX).
+    if (checkbox && checkbox.has(k)) {
+      out[k] = ['true', 'yes', 'y', '1', 'checked', 'on'].includes(String(v).trim().toLowerCase());
       continue;
     }
     out[k] = v;
@@ -626,7 +679,9 @@ async function handleCreate(req, res) {
     // asset needs all the fields. The join keys are still set here and never taken from
     // the caller.
     let detailRec = null, detailError = null;
-    const detIn = cleanWrite(body && body.detail, null, null, true);
+    const detIn = cleanWrite(body && body.detail, null,
+      DETAIL_NUMERIC[type] ? new Set(DETAIL_NUMERIC[type]) : null, true,
+      DETAIL_CHECKBOX[type] ? new Set(DETAIL_CHECKBOX[type]) : null);
     try {
       const d = await airtableWrite(encodeURIComponent(DETAIL_TABLE[type]), 'POST',
         { records: [{ fields: { ...detIn.fields, asset_id: assetId, asset: [rec.id] } }] });
@@ -703,7 +758,10 @@ async function handlePatch(req, res) {
     const admin = canAdmin(req);
     const allow = admin ? new Set([...CORE_WRITABLE, ...ADMIN_WRITABLE]) : CORE_WRITABLE;
     const core = cleanWrite(body.core, allow, CORE_NUMERIC, admin);
-    const det  = cleanWrite(body.detail, null, null, admin);
+    const det  = cleanWrite(body.detail, null,
+      DETAIL_NUMERIC[asset.category] ? new Set(DETAIL_NUMERIC[asset.category]) : null, admin,
+      DETAIL_CHECKBOX[asset.category] ? new Set(DETAIL_CHECKBOX[asset.category]) : null,
+      REG_PHOTO[asset.category] ? new Set(REG_PHOTO[asset.category].urls) : null);
     const rejected = [...core.rejected, ...det.rejected];
     if (!Object.keys(core.fields).length && !Object.keys(det.fields).length) {
       return res.status(400).json({ error: 'Nothing to update', rejected });
@@ -828,7 +886,15 @@ module.exports = async function handler(req, res) {
       let names = [];
       try { names = await detailFieldNames(table); } catch (_) { names = []; }
       res.setHeader('Cache-Control', 'public, max-age=300');
-      return res.status(200).json({ type, table, fields: names });
+      // numeric/checkbox tell the ADD form which of these plain-named fields need a
+      // number or checkbox input instead of free text - without this the create form
+      // cannot tell a Number column from a text one, which is how a typed-in
+      // no_of_rail lost an entire Guiderail detail row (and its photo) on 2026-08-28.
+      return res.status(200).json({
+        type, table, fields: names,
+        numeric: (DETAIL_NUMERIC[type] || []).filter(k => names.includes(k)),
+        checkbox: (DETAIL_CHECKBOX[type] || []).filter(k => names.includes(k)),
+      });
     }
 
     // distinct category (asset_type) values with counts — used to map each OMM
