@@ -68,6 +68,47 @@ const PROGRAMME = {
 const TYPE_PROGRAMME = {};
 for (const [name, p] of Object.entries(PROGRAMME)) if (!TYPE_PROGRAMME[p.type]) TYPE_PROGRAMME[p.type] = name;
 
+// ── What the sheet shows about the asset itself ──────────────────────────────
+// Troy, 2026-09-02: "it would be helpful to load a pic and quick short summary of
+// the asset at the top with the inspection elements below."
+//
+// A culvert has THREE photo slots because an inspection is supposed to check BOTH
+// ENDS — "sometimes that is the median, sometimes it is the other lane" — so these
+// are part of doing the job, not decoration. Field names verified against the live
+// table, not inferred: `headwall` looks like it should exist and does not.
+const PHOTO_SLOTS = {
+  Culvert:              [['photo_eb_url','EB end'], ['photo_wb_url','WB end'], ['photo_median_url','Median']],
+  Sign:                 [['photo_url','Front'], ['photo_back_url','Back']],
+  Guiderail:            [['leading_end_photo_url','Leading end'], ['terminating_end_photo_url','Terminating end']],
+  'Drainage Structure': [['photo_url','Photo']],
+  Lighting:             [['photo_url','Photo']],
+  Gate:                 [['photo_url','Photo']],
+  Fencing:              [['photo_url','Photo']],
+  'Barrier Wall':       [['photo_url','Photo']],
+};
+
+// A short summary, in the order a person reads it. Deliberately not every column —
+// the point is orientation before an inspection, not the full record, which the
+// Assets app already shows.
+const SUMMARY_FIELDS = {
+  Culvert:   [['crossing_name','Crossing'], ['type','Type'], ['pipe_class','Class'],
+              ['diameter_width_mm','Diameter / width (mm)'], ['height_mm','Height (mm)'],
+              ['length_m','Length (m)'], ['skew_angle','Skew'], ['fish_passage','Fish passage']],
+  Guiderail: [['no_of_rail','Rails'], ['length_m','Length (m)'], ['leading_end_type','Leading end'],
+              ['terminating_end_type','Terminating end']],
+  Sign:      [['sign_class','Class'], ['sign_material','Material'], ['mounting','Mounting'],
+              ['width_ft','Width (ft)'], ['height_ft','Height (ft)']],
+};
+
+function slotsFor(type){ return PHOTO_SLOTS[type] || []; }
+function summaryFor(type){ return SUMMARY_FIELDS[type] || []; }
+function detailFieldList(type){
+  var f = ['asset_id', 'maintenance_responsibility'];
+  slotsFor(type).forEach(function(s){ f.push(s[0]); });
+  summaryFor(type).forEach(function(s){ f.push(s[0]); });
+  return f.filter(function(v, i, a){ return a.indexOf(v) === i; });
+}
+
 // ⚠️ RESPONSIBILITY — 82 of the 811 registry culverts are NOT MRDC's to maintain
 // (NB DOT 65, NBDOT VERIFIED 7, "----" 7, Town of Oromocto 2, DND 1). Every one of
 // them is absent from the retired base and has never been inspected: the gap was
@@ -231,15 +272,32 @@ async function loadAssets(force) {
   return CACHE.assets;
 }
 
+// Keeps EVERY row for a key, not the last one. `asset_id` is a business key and 101
+// of them are shared, so "which detail row" can be genuinely ambiguous — and a photo
+// write must refuse rather than pick (claude/assets-record-id-addressing.md).
 async function loadDetails(type, force) {
   const table = DETAIL_TABLE[type];
   if (!table) return {};
   if (!force && CACHE.details[type]) return CACHE.details[type];
-  const rows = await allRows(table, ['asset_id', 'maintenance_responsibility']);
+  const rows = await allRows(table, detailFieldList(type));
   const by = {};
-  for (const r of rows) { const k = str(r.asset_id); if (k) by[k] = r; }
+  for (const r of rows) { const k = str(r.asset_id); if (k) (by[k] = by[k] || []).push(r); }
   CACHE.details[type] = by;
   return by;
+}
+const firstDetail = (by, key) => { const a = by[key]; return a && a.length ? a[0] : undefined; };
+
+// The asset card: the photo slots with whatever is on file, and a short summary.
+function assetCard(type, detail) {
+  const d = detail || {};
+  return {
+    photos: slotsFor(type).map(function (s) {
+      return { field: s[0], label: s[1], url: str(d[s[0]]) || null };
+    }),
+    summary: summaryFor(type).map(function (s) {
+      return { field: s[0], label: s[1], value: str(d[s[0]]) };
+    }).filter(function (x) { return x.value; }),
+  };
 }
 
 async function loadInspections(force) {
@@ -307,6 +365,47 @@ function stateFor(nextDue, year) {
   return 'ok';
 }
 
+// ── Which year should the page open on? ──────────────────────────────────────
+// Opening on the current year is arithmetically correct and reads as a lie. In 2026
+// the culvert programme shows "98 of 697 outstanding" because 599 were done in 2025
+// and are not due again until 2027 — so the page looked nearly finished when the job
+// ahead is the whole 697-asset 2027 pass.
+//
+// The rule: open on the earliest year that has assets actually coming DUE. Backlog —
+// `never` and `overdue` — is carried into EVERY year's view, so nothing is hidden by
+// skipping a year that has no new work of its own. A year with due = 0 is a year with
+// nothing new to schedule.
+//
+// This is derived from the data, never hardcoded. For culverts it lands on 2027; for
+// an annual programme with assets due this year it lands on this year, which is why it
+// is expressed as a rule and not as a constant.
+const HORIZON_CAP = 10;               // one bad date must not generate a thousand years
+
+function yearPlan(rows, thisYear) {
+  let horizon = thisYear;
+  for (const r of rows) {
+    if (r.next_due != null && r.next_due > horizon) horizon = r.next_due;
+  }
+  if (horizon > thisYear + HORIZON_CAP) horizon = thisYear + HORIZON_CAP;
+
+  const plan = [];
+  for (let y = thisYear; y <= horizon; y++) {
+    const c = { never: 0, overdue: 0, due: 0, ok: 0 };
+    for (const r of rows) c[stateFor(r.next_due, y)]++;
+    plan.push({ year: y, never: c.never, overdue: c.overdue, due: c.due, ok: c.ok,
+                outstanding: c.never + c.overdue + c.due });
+  }
+  return plan;
+}
+
+function suggestedYear(plan, thisYear) {
+  if (!plan.length) return thisYear;
+  const due = plan.find(p => p.due > 0);
+  if (due) return due.year;
+  const any = plan.find(p => p.outstanding > 0);   // all backlog, no scheduled work
+  return any ? any.year : thisYear;
+}
+
 function latestFor(rows) {
   let best = null;
   for (const r of rows) {
@@ -317,6 +416,9 @@ function latestFor(rows) {
 }
 
 // ── Worklist ─────────────────────────────────────────────────────────────────
+// `year` may be null, meaning "pick the year the work is actually in" (suggestedYear).
+// The returned `year` is always the one the states were computed against, and
+// `yearAuto` says whether the caller asked for it or the data chose it.
 async function buildWorklist(programmeName, year, force) {
   const prog = PROGRAMME[programmeName];
   const assets = await loadAssets(force);
@@ -337,7 +439,7 @@ async function buildWorklist(programmeName, year, force) {
     if (a.type !== prog.type) continue;
     if (/^retired$/i.test(a.status)) { excluded.retired++; continue; }
 
-    const resp = responsibilityOf(details[a.asset_id]);
+    const resp = responsibilityOf(firstDetail(details, a.asset_id));
     if (!resp.assessed) { excluded.unassessed++; continue; }
     if (!resp.ours)     { excluded.notOurs++; continue; }
 
@@ -357,11 +459,18 @@ async function buildWorklist(programmeName, year, force) {
       last_result: last ? last.result : '',
       next_due: nextDue,
       next_due_date: last ? last.next_due_date : null,
-      state: stateFor(nextDue, year),
+      state: null,                       // needs the year, and the year needs the rows
       count: mine.length,
       locatable: a.lat != null && a.lng != null,
     });
   }
+
+  // The year has to come after the rows: it is derived from when they fall due.
+  const thisYear = new Date().getUTCFullYear();
+  const plan = yearPlan(rows, thisYear);
+  const yearAuto = year == null;
+  if (yearAuto) year = suggestedYear(plan, thisYear);
+  for (const r of rows) r.state = stateFor(r.next_due, year);
 
   // Ordered the way a crew works it: what needs doing first, then along the road.
   const RANK = { never: 0, overdue: 1, due: 2, ok: 3 };
@@ -378,7 +487,8 @@ async function buildWorklist(programmeName, year, force) {
 
   return {
     programme: programmeName, standard: prog.standard, cycle: prog.cycle, type: prog.type,
-    year, total: rows.length, outstanding, counts, excluded,
+    year, yearAuto, thisYear, years: plan,
+    total: rows.length, outstanding, counts, excluded,
     noCoordinates: rows.filter(r => !r.locatable).length,
     noDivision: rows.filter(r => !r.division).length,
     rows,
@@ -440,7 +550,9 @@ module.exports = async function handler(req, res) {
         return res.status(400).json({ error: `"${want}" is not a known programme or asset type.`,
           programmes: Object.keys(PROGRAMME), types: Object.keys(TYPE_PROGRAMME) });
       }
-      const year = int(q.year) || thisYear;
+      // No year= at all means "you decide" (suggestedYear). An explicit year= wins,
+      // including a year in the past, so a closed-out cycle can still be reviewed.
+      const year = has('year') ? (int(q.year) || thisYear) : null;
       const out = await buildWorklist(programmeName, year, force);
       res.setHeader('Cache-Control', force ? 'no-store' : 'public, max-age=60');
       return res.status(200).json(out);
@@ -465,6 +577,16 @@ module.exports = async function handler(req, res) {
         .filter(i => i.asset_id === key)
         .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
 
+      // The sheet opens on this, so hand it the picture and the summary too rather
+      // than making the page make a second call while someone stands at a culvert.
+      let card = null;
+      if (asset && DETAIL_TABLE[asset.type]) {
+        const by = await loadDetails(asset.type, force);
+        const rows2 = by[asset.asset_id] || [];
+        card = assetCard(asset.type, rows2[0]);
+        card.ambiguous = rows2.length > 1 ? rows2.length : 0;
+      }
+
       const prog = asset ? PROGRAMME[TYPE_PROGRAMME[asset.type]] : null;
       const last = latestFor(rows);
       const nextDue = last ? (last.next_due != null ? last.next_due : (yearOf(last.date) + (prog ? prog.years : 2))) : null;
@@ -473,6 +595,7 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({
         asset_id: key,
         asset: asset || null,
+        card,
         sharedIds: shared.length > 1 ? shared.map(a => ({ recId: a.recId, name: a.name })) : undefined,
         thisYear,
         count: rows.length,
@@ -621,6 +744,17 @@ async function handlePost(req, res, caller) {
   };
   if (nextDueDate) fields.next_due_date = nextDueDate;
   if (str(body.photo_url)) fields.photo_url = str(body.photo_url);
+
+  // The end photos. A culvert inspection checks BOTH ends, so these are graded
+  // evidence, not decoration — they are stored on the INSPECTION whatever else
+  // happens, which is what keeps the history when the asset's own slot is later
+  // refreshed to a newer picture.
+  const slots = asset ? slotsFor(asset.type) : [];
+  const sent = (body.photos && typeof body.photos === 'object') ? body.photos : {};
+  const givenSlots = slots.filter(function (sl) { return str(sent[sl[0]]); });
+  for (const sl of givenSlots) fields[sl[0]] = str(sent[sl[0]]);
+  const wantAssetUpdate = !!body.update_asset_photos && givenSlots.length > 0;
+  if (givenSlots.length) fields.asset_photos_updated = wantAssetUpdate ? 'Yes' : 'No';
   if (num(body.gps_lat) != null) fields.gps_lat = num(body.gps_lat);
   if (num(body.gps_lng) != null) fields.gps_lng = num(body.gps_lng);
 
@@ -696,6 +830,33 @@ async function handlePost(req, res, caller) {
     }
   }
 
+  // Refreshing the asset's own photo is a THIRD write and is allowed to fail on its
+  // own terms: the inspection and its findings are the record, the registry picture
+  // is a convenience. Reported back rather than swallowed.
+  let assetPhotos = null;
+  let assetPhotoError = null;
+  if (wantAssetUpdate && asset) {
+    try {
+      const by = await loadDetails(asset.type, true);
+      const rows = by[asset.asset_id] || [];
+      if (!rows.length) {
+        assetPhotoError = 'This asset has no detail row, so its photo slots could not be updated.';
+      } else if (rows.length > 1) {
+        // Refuse rather than pick. Writing a photo onto "probably the right one" is
+        // how edits landed on the wrong barrier wall for weeks.
+        assetPhotoError = `asset_id "${asset.asset_id}" is shared by ${rows.length} detail rows, so the asset photo was not changed.`;
+      } else {
+        const patch = {};
+        for (const sl of givenSlots) patch[sl[0]] = str(sent[sl[0]]);
+        await airtableWrite(`${encodeURIComponent(DETAIL_TABLE[asset.type])}/${rows[0].recId}`,
+          'PATCH', { fields: patch });
+        assetPhotos = Object.keys(patch);
+      }
+    } catch (e) {
+      assetPhotoError = e.message || 'The asset photo could not be updated.';
+    }
+  }
+
   fresh();
   return res.status(201).json({
     ok: true,
@@ -703,10 +864,14 @@ async function handlePost(req, res, caller) {
                   next_due_date: nextDueDate, checks_total: graded, checks_failed: failures.length },
     findings,
     findingsError,
+    assetPhotos,
+    assetPhotoError,
   });
 }
 
 module.exports.__test = {
   stateFor, latestFor, divisionFor, correctBy, responsibilityOf, yearOf,
+  yearPlan, suggestedYear,
+  slotsFor, summaryFor, detailFieldList, assetCard, firstDetail, PHOTO_SLOTS, SUMMARY_FIELDS,
   PROGRAMME, TYPE_PROGRAMME, DETAIL_TABLE, buildWorklist, canEdit,
 };
