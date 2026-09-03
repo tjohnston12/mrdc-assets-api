@@ -537,7 +537,17 @@ module.exports = async function handler(req, res) {
         return res.status(404).json({ error: `No criteria on file for "${want}".`,
           standards: [...new Set(all.map(c => c.standard))].sort() });
       }
-      res.setHeader('Cache-Control', force ? 'no-store' : 'public, max-age=300');
+      // PRIVATE, not public. Every response from this endpoint is behind a session —
+      // `private` tells shared caches they may not store it, and only the one
+      // browser that asked may. It was `public` until 2026-09-02, which was found by
+      // an unauthenticated probe returning 200: the browser had served it the CACHED
+      // body of an earlier authenticated call. The guard itself was never broken
+      // (?fresh=1 returns a clean 401), but a session-gated payload marked `public`
+      // is the wrong instruction to give a cache.
+      // ⚠️ `api/assets.js` and `api/inspections.js` still use `public` on the same
+      // pattern — same fix, not made here because those are in daily use and the
+      // change was not tested against them.
+      res.setHeader('Cache-Control', force ? 'no-store' : 'private, max-age=300');
       return res.status(200).json({ standard: want, standard_title: rows[0].standard_title, count: rows.length, criteria: rows });
     }
 
@@ -554,7 +564,7 @@ module.exports = async function handler(req, res) {
       // including a year in the past, so a closed-out cycle can still be reviewed.
       const year = has('year') ? (int(q.year) || thisYear) : null;
       const out = await buildWorklist(programmeName, year, force);
-      res.setHeader('Cache-Control', force ? 'no-store' : 'public, max-age=60');
+      res.setHeader('Cache-Control', force ? 'no-store' : 'private, max-age=60');
       return res.status(200).json(out);
     }
 
@@ -591,7 +601,7 @@ module.exports = async function handler(req, res) {
       const last = latestFor(rows);
       const nextDue = last ? (last.next_due != null ? last.next_due : (yearOf(last.date) + (prog ? prog.years : 2))) : null;
 
-      res.setHeader('Cache-Control', force ? 'no-store' : 'public, max-age=60');
+      res.setHeader('Cache-Control', force ? 'no-store' : 'private, max-age=60');
       return res.status(200).json({
         asset_id: key,
         asset: asset || null,
@@ -619,7 +629,7 @@ module.exports = async function handler(req, res) {
         if (r.year != null && (e.lastYear == null || r.year > e.lastYear)) { e.lastYear = r.year; e.nextDue = r.next_due; }
       }
       for (const e of Object.values(byAsset)) e.state = stateFor(e.nextDue, thisYear);
-      res.setHeader('Cache-Control', force ? 'no-store' : 'public, max-age=60');
+      res.setHeader('Cache-Control', force ? 'no-store' : 'private, max-age=60');
       return res.status(200).json({ total: rows.length, assets: Object.keys(byAsset).length, thisYear, byAsset });
     }
 
