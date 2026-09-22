@@ -451,13 +451,19 @@ function applyCors(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-user-role, x-app-role, x-user-id, x-user-name');
 }
-/* ⚠️ "private", not "public" — see the long note in assets.js. Allow-Origin
-   above is REFLECTED, so this response names one caller, and a shared cache
-   that hands it to a different one breaks that caller outright. It did, in
-   production on 2026-09-22: the patrol form could not load the asset register
-   because Vercel's edge had kept the DMT's copy. A browser honours Vary:
-   Origin; the edge does not. "private" lets the reader keep it and stops
-   anything in between. */
+/* ⚠️ A response that named its caller is stored by nobody — not the edge, and
+   not the browser, which keeps ONE entry per URL and hands it to the next
+   origin that asks. Measured on 2026-09-22: after the first fix a plain fetch
+   from dmt.mrdc-htra.com still failed while the same fetch with
+   cache:'no-store' succeeded. A response that reflected nothing (a
+   server-to-server caller sends no Origin) is the same for everybody and keeps
+   its cache. The long version is in assets.js.
+
+   ⚠️ A new cacheable branch passes its value through cacheFor(). */
+function cacheFor(res, value) {
+  res.setHeader('Cache-Control',
+    res.getHeader('Access-Control-Allow-Origin') ? 'no-store' : value);
+}
 
 // ── Handler ─────────────────────────────────────────────────────────────────
 
@@ -485,7 +491,7 @@ module.exports = async function handler(req, res) {
           ? 'Could not load the directory — does the assets PAT have read access to the Employees base appraSoUXoTbhroG6?'
           : `Could not load the directory — ${e.message}`;
       }
-      res.setHeader('Cache-Control', 'private, max-age=60');
+      cacheFor(res, 'public, max-age=60');
       return res.status(200).json({
         ok: true,
         choices: {
@@ -527,7 +533,7 @@ module.exports = async function handler(req, res) {
     }
 
     if (qs.stats) {
-      res.setHeader('Cache-Control', 'private, max-age=60');
+      cacheFor(res, 'public, max-age=60');
       return res.status(200).json({ ok: true, stats: buildStats(rows) });
     }
 
@@ -556,7 +562,7 @@ module.exports = async function handler(req, res) {
                     || String(b.media_id).localeCompare(String(a.media_id)));
 
     const limit = Math.min(parseInt(want('limit'), 10) || 1000, 5000);
-    res.setHeader('Cache-Control', 'private, max-age=60');
+    cacheFor(res, 'public, max-age=60');
     return res.status(200).json({ ok: true, media: out.slice(0, limit), count: out.length });
 
   } catch (e) {

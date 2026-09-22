@@ -28,7 +28,8 @@ const eq = (n, g, w) => ok(n, JSON.stringify(g) === JSON.stringify(w),
 
 const cors = (SRC.match(/const ORIGIN_OK = [^\n]*\n+function applyCors\(req, res\) \{[\s\S]*?\n\}/) || [''])[0];
 ok('applyCors() and its origin pattern can be lifted', !!cors);
-const cf = '';
+const cf = (SRC.match(/function cacheFor\(res, value\) \{[\s\S]*?\n\}/) || [''])[0];
+ok('cacheFor() can be lifted too', !!cf);
 
 function stub(origin, tail) {
   const h = {};
@@ -60,18 +61,31 @@ function stub(origin, tail) {
      'https://x-abc123.vercel.app');
 }
 {
-  /* Nothing here may be shared. Both summary responses used to be
-     "public, max-age=60"; the reader keeps its minute, nothing else does. */
-  const set = SRC.match(/Cache-Control',\s*[^)]*\)/g) || [];
-  ok('the cache headers can be read out of the source', set.length > 0, String(set.length));
-  eq('no response is cacheable by a shared cache', set.filter(s => /'public/.test(s)), []);
-  ok('and every one of them is private or no-store',
-     set.every(s => /'private|no-store/.test(s)), set.filter(s => !/'private|no-store/.test(s)).join(' | '));
-  ok('the summaries are still cacheable by the reader',
-     (SRC.match(/'private, max-age=60'/g) || []).length === 2,
-     String((SRC.match(/'private, max-age=60'/g) || []).length));
-  ok('the reason is written down beside applyCors',
-     /REFLECTED/.test(SRC) && /edge does not/.test(SRC));
+  /* ⚠️ The rule is by CALLER. A named caller's response is kept by nobody; a
+     caller that reflected nothing gets the cache the endpoint asked for. */
+  const named = stub('https://www.mrdc-htra.com', '\ncacheFor(res, "public, max-age=60");');
+  eq('a named caller\'s response is stored by nobody', named['Cache-Control'], 'no-store');
+  const anon = stub(undefined, '\ncacheFor(res, "public, max-age=60");');
+  ok('a caller with no Origin reflects nothing',
+     !('Access-Control-Allow-Origin' in anon), JSON.stringify(anon));
+  eq('so its response keeps the cache the endpoint asked for',
+     anon['Cache-Control'], 'public, max-age=60');
+}
+{
+  /* The only setHeader('Cache-Control', …) in the file is the one INSIDE
+     cacheFor(). Any other is a branch that bypassed the rule. */
+  const CODE = SRC.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1 ');
+  const set = (CODE.match(/setHeader\('Cache-Control',[\s\S]{0,80}?\)/g) || [])
+    .filter(x => !/getHeader\('Access-Control-Allow-Origin'\)/.test(x));
+  eq('no Cache-Control is set outside cacheFor()', set, []);
+  /* Count the CALLS, not the definition — a branch that quietly stops setting
+     a header at all would otherwise slip past a ">=" check. */
+  const calls = (CODE.match(/cacheFor\(res,/g) || []).length - 1;
+  eq('every cacheable branch goes through it, and none was dropped', calls, 2);
+  ok('and cacheFor reads the header rather than re-deciding the origin',
+     /res\.getHeader\('Access-Control-Allow-Origin'\) \? 'no-store' :/.test(SRC));
+  ok('the reason is written down beside it',
+     /ONE entry per URL/.test(SRC));
 }
 console.log(`\n  ${pass} passed, ${fail} failed`);
 if (fail) { failures.forEach(f => console.log('   FAIL  ' + f)); process.exitCode = 1; }

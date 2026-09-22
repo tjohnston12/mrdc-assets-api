@@ -602,12 +602,13 @@ function applyCors(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-user-role, x-app-role, x-user-id, x-user-name');
 }
 
-/* ⚠️ EVERY CACHEABLE RESPONSE FROM HERE IS "private", AND THAT IS NOT A
-   PREFERENCE. Access-Control-Allow-Origin above is REFLECTED — it names one
-   caller, so two callers get two different responses from the same URL. Vary:
-   Origin is the header that is supposed to keep them apart, and a browser does
-   honour it; a shared cache in front of this function is not obliged to, and
-   Vercel's edge does not.
+/* ⚠️ A RESPONSE THAT NAMES ITS CALLER IS NOT STORED BY ANYBODY, AND THAT IS
+   NOT A PREFERENCE. Access-Control-Allow-Origin above is REFLECTED — it names
+   one caller, so two callers get two different responses from the same URL.
+   Vary: Origin is the header that is supposed to keep them apart, and neither
+   cache in the path can be trusted with it: Vercel's edge ignores it outright,
+   and the browser keeps ONE entry per URL and will hand the stored one to the
+   next origin that asks.
 
    What that cost, found in production on 2026-09-22: the patrol form on
    www.mrdc-htra.com could not load the asset register at all — "Failed to
@@ -620,13 +621,26 @@ function applyCors(req, res) {
    never sees it; a supervisor with both apps open breaks the patrol form every
    time they touch the DMT.
 
-   "private" says: a browser may keep this, a shared cache may not. The reader
-   keeps its five minutes; nothing in between keeps anything. A conditional
-   request is not a way out — a 304 reuses the STORED headers, which are the
-   wrong caller's.
+   "private" was the first fix and it was only half of one: it stops the edge
+   sharing the response, and then the BROWSER'S own cache does the same thing.
+   Measured on 2026-09-22, after that deploy: a plain fetch of ?all=1 from
+   dmt.mrdc-htra.com still failed while the same fetch with cache:'no-store'
+   succeeded, because the browser was still holding www's copy. A conditional
+   request is no way out either — a 304 reuses the STORED headers, which are
+   the wrong caller's.
 
-   ⚠️ So: if a response here carries a reflected Allow-Origin, it must not be
-   "public". Adding a new cacheable branch below means adding a private one. */
+   So the rule is by CALLER, not by endpoint. A response that reflected an
+   origin is "no-store": nobody keeps it, and every reader is safe whether or
+   not it remembers to ask for a fresh copy. A response that reflected nothing
+   — a server-to-server caller sends no Origin — is the same for everybody and
+   keeps its cache, which is what DMT intake's ?id= lookups run on.
+
+   ⚠️ Adding a cacheable branch below means passing its value through
+   cacheFor(), not calling setHeader('Cache-Control', …) directly. */
+function cacheFor(res, value) {
+  res.setHeader('Cache-Control',
+    res.getHeader('Access-Control-Allow-Origin') ? 'no-store' : value);
+}
 
 // ── Creating an asset ───────────────────────────────────────────────────────
 // The one place a new federation key enters the register, so the guards here matter
@@ -892,7 +906,7 @@ module.exports = async function handler(req, res) {
           bt[g.key] = (bt[g.key] || 0) + 1;
         }
       }
-      res.setHeader('Cache-Control', 'private, max-age=60');
+      cacheFor(res, 'public, max-age=60');
       return res.status(200).json({
         total: rows.length,
         gaps: GAPS.map(g => ({ key: g.key, label: g.label, count: totals[g.key] })),
@@ -911,7 +925,7 @@ module.exports = async function handler(req, res) {
       if (!table) return res.status(400).json({ error: `"${type}" is not a known asset type.`, types: Object.keys(DETAIL_TABLE) });
       let names = [];
       try { names = await detailFieldNames(table); } catch (_) { names = []; }
-      res.setHeader('Cache-Control', 'private, max-age=300');
+      cacheFor(res, 'public, max-age=300');
       // numeric/checkbox tell the ADD form which of these plain-named fields need a
       // number or checkbox input instead of free text - without this the create form
       // cannot tell a Number column from a text one, which is how a typed-in
@@ -934,7 +948,7 @@ module.exports = async function handler(req, res) {
       }
       const list = Object.entries(tally).sort((x, y) => y[1] - x[1])
         .map(([category, count]) => ({ category, count }));
-      res.setHeader('Cache-Control', 'private, max-age=300');
+      cacheFor(res, 'public, max-age=300');
       return res.status(200).json({ total: register.length, types: list });
     }
 
@@ -950,9 +964,9 @@ module.exports = async function handler(req, res) {
     // Saving an edit and seeing the OLD values come back had TWO causes, and fixing
     // only one would have left the bug intermittent:
     //   1. This response used to be cacheable for five minutes, so the BROWSER
-    //      served the pre-edit body for that long. (Every cacheable response here
-    //      is "private" now — see applyCors — but private still means the browser
-    //      may keep it, so ?fresh=1 is still what bypasses it.)
+    //      served the pre-edit body for that long. (A response that named its
+    //      caller is "no-store" now — see cacheFor — but a server-to-server read
+    //      still caches, so ?fresh=1 is still what bypasses it.)
     //   2. `CACHE` is per-lambda-instance memory. handlePatch clears it in the
     //      instance that handled the PATCH; the GET that follows can land on a
     //      DIFFERENT warm instance still holding a five-minute-old register. No
@@ -975,7 +989,7 @@ module.exports = async function handler(req, res) {
           if (shaped) one = shaped;
         } catch (_) { /* fall back to the cached row rather than 404 a record that exists */ }
       }
-      res.setHeader('Cache-Control', fresh ? 'no-store' : 'private, max-age=300');
+      cacheFor(res, fresh ? 'no-store' : 'public, max-age=300');
       if (!one) return res.status(404).json({ error: 'Asset not found', id: String(rec || id) });
       // Every record sharing this asset_id, so the page can say so out loud instead
       // of silently showing one of several. Always computed from the asset actually
@@ -1017,7 +1031,7 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    res.setHeader('Cache-Control', 'private, max-age=300');
+    cacheFor(res, 'public, max-age=300');
     return res.status(200).json(register);
   } catch (e) {
     console.error('assets endpoint error:', e);

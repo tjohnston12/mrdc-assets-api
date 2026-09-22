@@ -82,31 +82,59 @@ function headersFor(origin) {
      prev['Access-Control-Allow-Origin'], 'https://mrdc-assets-api-abc123.vercel.app');
 }
 
-/* ══ 2 · nothing cacheable is public ══════════════════════════════════════ */
-{
-  const set = SRC.match(/Cache-Control',\s*[^)]*\)/g) || [];
-  ok('the cache headers can be read out of the source', set.length > 0, String(set.length));
-  const pub = set.filter(s => /'public/.test(s));
-  eq('no response is cacheable by a shared cache', pub, []);
-  /* And they are actually there — a file with none would pass the line above
-     while caching nothing at all, or everything by default. */
-  ok('the register response is still cacheable by the reader',
-     /res\.setHeader\('Cache-Control', 'private, max-age=300'\);\n    return res\.status\(200\)\.json\(register\);/.test(SRC));
-  ok('and every one of them is private or no-store',
-     set.every(s => /'private|no-store/.test(s)), set.filter(s => !/'private|no-store/.test(s)).join(' | '));
+/* ══ 2 · the caching rule is by CALLER, not by endpoint ══════════════════
+   ⚠️ "private" was the first fix and it was only half of one. It stops the
+   edge sharing the response, and then the BROWSER'S own cache does the same
+   thing: it keeps one entry per URL and hands the stored one to the next
+   origin that asks. Measured in production 2026-09-22, after that deploy — a
+   plain fetch of ?all=1 from dmt.mrdc-htra.com still failed while the same
+   fetch with cache:'no-store' succeeded. */
+const cf = (SRC.match(/function cacheFor\(res, value\) \{[\s\S]*?\n\}/) || [''])[0];
+ok('cacheFor() can be lifted', !!cf);
+function withCache(origin, value) {
+  const h = {};
+  const res = { setHeader: (k, v) => { h[k] = v; }, getHeader: k => h[k] };
+  const req = { headers: origin === undefined ? {} : { origin } };
+  new Function('req', 'res', lifted + '\n' + cf +
+    '\napplyCors(req, res); cacheFor(res, ' + JSON.stringify(value) + ');')(req, res);
+  return h;
 }
 {
-  /* ?fresh=1 exists because "private" still lets the BROWSER hold a record for
-     five minutes, and saving an edit has to show the edit. */
-  ok('?fresh=1 still bypasses the reader\'s own cache',
-     /fresh \? 'no-store' : 'private, max-age=300'/.test(SRC));
-}
-{
-  /* The reflected header and the caching rule live together; a future reader
-     changing one has to meet the other. */
-  ok('the reason is written down beside applyCors, not only here',
-     /reflected/i.test(SRC) && /Vercel's edge does not/.test(SRC));
-}
+  const named = withCache('https://www.mrdc-htra.com', 'public, max-age=300');
+  eq('a named caller is named in the response',
+     named['Access-Control-Allow-Origin'], 'https://www.mrdc-htra.com');
+  eq('and its response is stored by nobody', named['Cache-Control'], 'no-store');
+  const dmt = withCache('https://dmt.mrdc-htra.com', 'public, max-age=300');
+  eq('the same for any other named caller', dmt['Cache-Control'], 'no-store');
 
+  /* A server-to-server caller — DMT intake's ?id= lookups — sends no Origin,
+     reflects nothing, and gets a response that is the same for everybody. */
+  const anon = withCache(undefined, 'public, max-age=300');
+  ok('a caller with no Origin reflects nothing',
+     !('Access-Control-Allow-Origin' in anon), JSON.stringify(anon));
+  eq('so it keeps the cache the endpoint asked for',
+     anon['Cache-Control'], 'public, max-age=300');
+  eq('and a no-store endpoint stays no-store for it',
+     withCache(undefined, 'no-store')['Cache-Control'], 'no-store');
+}
+{
+  /* ⚠️ The only setHeader('Cache-Control', …) in the file is the one inside
+     cacheFor(). Any other is a branch that went round the rule. */
+  const CODE = SRC.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1 ');
+  const stray = (CODE.match(/setHeader\('Cache-Control',[\s\S]{0,80}?\)/g) || [])
+    .filter(x => !/getHeader\('Access-Control-Allow-Origin'\)/.test(x));
+  eq('no Cache-Control is set outside cacheFor()', stray, []);
+  ok('every cacheable branch goes through it',
+     (SRC.match(/cacheFor\(res,/g) || []).length >= 5,
+     String((SRC.match(/cacheFor\(res,/g) || []).length));
+  ok('cacheFor decides from the header that was actually set',
+     /res\.getHeader\('Access-Control-Allow-Origin'\) \? 'no-store' :/.test(SRC));
+  ok('the register is still the endpoint that asks for five minutes',
+     /cacheFor\(res, 'public, max-age=300'\);\n    return res\.status\(200\)\.json\(register\);/.test(SRC));
+  ok('?fresh=1 still refuses a cache even for a caller that would get one',
+     /cacheFor\(res, fresh \? 'no-store' : 'public, max-age=300'\)/.test(SRC));
+  ok('the reason is written down beside applyCors, not only here',
+     /REFLECTED/.test(SRC) && /ONE entry per URL/.test(SRC));
+}
 console.log(`\n  ${pass} passed, ${fail} failed`);
 if (fail) { failures.forEach(f => console.log('   FAIL  ' + f)); process.exitCode = 1; }
