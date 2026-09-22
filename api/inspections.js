@@ -38,6 +38,13 @@ function applyCors(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
+/* ⚠️ "private", not "public" — see the long note in assets.js. Allow-Origin
+   above is REFLECTED, so this response names one caller, and a shared cache
+   that hands it to a different one breaks that caller outright. It did, in
+   production on 2026-09-22: the patrol form could not load the asset register
+   because Vercel's edge had kept the DMT's copy. A browser honours Vary:
+   Origin; the edge does not. "private" lets the reader keep it and stops
+   anything in between. */
 
 const TTL_MS = 5 * 60 * 1000;
 let CACHE = { at: 0, rows: null };
@@ -175,7 +182,7 @@ module.exports = async function handler(req, res) {
         byAsset[id] = { count: e.count, lastYear: e.lastYear, nextDue: e.nextDue,
                         state: e.state, withReport: e.withReport, standards: e.standards };
       }
-      res.setHeader('Cache-Control', 'public, max-age=60');
+      res.setHeader('Cache-Control', 'private, max-age=60');
       return res.status(200).json({ total: rows.length, assets: Object.keys(byAsset).length, thisYear, byAsset });
     }
 
@@ -194,7 +201,7 @@ module.exports = async function handler(req, res) {
         if (g && g.year === r.year) g.rows.push(r);
         else years.push({ year: r.year, rows: [r] });
       }
-      res.setHeader('Cache-Control', 'public, max-age=60');
+      res.setHeader('Cache-Control', 'private, max-age=60');
       return res.status(200).json({
         asset_id: asset, thisYear,
         count: rows.length,

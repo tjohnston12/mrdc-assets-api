@@ -55,10 +55,14 @@ function resetDb() {
     ],
     [T.CULV]: [
       { id: 'recC1', fields: { asset_id: 'MRDC-CV-1', maintenance_responsibility: 'MRDC' } },
-      { id: 'recC2', fields: { asset_id: 'MRDC-CV-2', maintenance_responsibility: 'MRDC' } },
+      { id: 'recC2', fields: { asset_id: 'MRDC-CV-2', maintenance_responsibility: 'MRDC',
+        photo_eb_url: 'https://res.cloudinary.com/x/eb-old.png', photo_median_url: 'https://res.cloudinary.com/x/med-old.png',
+        crossing_name: 'Tributary of Taylor’s Brook', type: 'Culvert', pipe_class: 'Conc. Pipe',
+        diameter_width_mm: '1200', length_m: '52.7', fish_passage: 'No', height_mm: '' } },
       { id: 'recC3', fields: { asset_id: 'MRDC-CV-NBDOT', maintenance_responsibility: 'NB DOT' } },
       { id: 'recC5', fields: { asset_id: 'MRDC-CV-RETIRED', maintenance_responsibility: 'MRDC' } },
       { id: 'recC6', fields: { asset_id: 'DUP', maintenance_responsibility: 'MRDC' } },
+      { id: 'recC7', fields: { asset_id: 'DUP', maintenance_responsibility: 'MRDC' } },
     ],
     [T.INSP]: [
       { id: 'recI1', fields: { inspection_id: 'AI-2025-CU-1', asset_id: 'MRDC-CV-1', programme: 'Culverts', standard: 'OMM 303', date: '2025-06-01', year: 2025, next_due: 2027, result: 'Pass', checks_total: 15, checks_failed: 0 } },
@@ -191,6 +195,134 @@ function mod() {
   eq('worklist: division is derived onto the row', wl.rows.find(r => r.asset_id === 'MRDC-CV-1').division, 'Western');
   eq('worklist: outstanding counts never+overdue+due', wl.outstanding, wl.counts.never + wl.counts.overdue + wl.counts.due);
   ok('worklist: reports how many cannot be located by GPS', typeof wl.noCoordinates === 'number');
+  eq('worklist: an explicit year is not overridden', wl.year, 2027);
+  eq('worklist: and it says the year was asked for, not chosen', wl.yearAuto, false);
+
+  // ── the year the page opens on ─────────────────────────────────────────────
+  // Pure-function tests first: the rule must be readable without the whole DB.
+  const TY = 2026;
+  {
+    // The real culvert shape: nothing DUE in 2026, 599 due in 2027, plus backlog.
+    const rows = [];
+    for (let i = 0; i < 599; i++) rows.push({ next_due: 2027 });
+    for (let i = 0; i < 32; i++)  rows.push({ next_due: 2024 });   // overdue
+    for (let i = 0; i < 66; i++)  rows.push({ next_due: null });   // never
+    const plan = M.yearPlan(rows, TY);
+    eq('yearPlan: starts at this year', plan[0].year, TY);
+    eq('yearPlan: runs to the last due year', plan[plan.length - 1].year, 2027);
+    eq('yearPlan: 2026 has nothing coming due', plan[0].due, 0);
+    eq('yearPlan: 2026 outstanding is the backlog only', plan[0].outstanding, 98);
+    eq('yearPlan: 2027 is the whole scope', plan[1].outstanding, 697);
+    eq('yearPlan: backlog is carried into 2027 too', plan[1].overdue + plan[1].never, 98);
+    eq('suggestedYear: skips a year with nothing due', M.suggestedYear(plan, TY), 2027);
+  }
+  {
+    // An annual programme with work due this year must NOT skip ahead.
+    const rows = [{ next_due: 2026 }, { next_due: 2027 }, { next_due: null }];
+    const plan = M.yearPlan(rows, TY);
+    eq('suggestedYear: does not skip a year that HAS work due', M.suggestedYear(plan, TY), TY);
+  }
+  {
+    // Nothing has ever been inspected: there is no due year to find. Open on now.
+    const rows = [{ next_due: null }, { next_due: null }];
+    const plan = M.yearPlan(rows, TY);
+    eq('yearPlan: no future dates means a single year', plan.length, 1);
+    eq('suggestedYear: all-backlog opens on this year', M.suggestedYear(plan, TY), TY);
+  }
+  {
+    // Everything is overdue and nothing is scheduled — still this year, not a guess.
+    const rows = [{ next_due: 2019 }, { next_due: 2020 }];
+    eq('suggestedYear: all-overdue opens on this year', M.suggestedYear(M.yearPlan(rows, TY), TY), TY);
+  }
+  {
+    // One bad date must not generate a thousand years of plan.
+    const rows = [{ next_due: 2027 }, { next_due: 9999 }];
+    const plan = M.yearPlan(rows, TY);
+    ok('yearPlan: a wild due year is capped, not obeyed', plan.length <= 11, 'length ' + plan.length);
+    eq('yearPlan: the cap is this year + 10', plan[plan.length - 1].year, TY + 10);
+    eq('suggestedYear: still finds the real due year', M.suggestedYear(plan, TY), 2027);
+  }
+  eq('yearPlan: no rows at all is one year, not a crash', M.yearPlan([], TY).length, 1);
+  eq('suggestedYear: an empty plan falls back to this year', M.suggestedYear([], TY), TY);
+
+  // And end-to-end. The fixture is pinned RELATIVE to today so this keeps testing the
+  // same shape every year: nothing falls due in the current year, one culvert falls
+  // due next year. The current year is the plausible-looking wrong answer — it is
+  // exactly what the page used to do — so asserting "some year >= this year" would
+  // let the original bug straight back through.
+  {
+    resetDb();
+    const TY_NOW = new Date().getUTCFullYear();
+    DB[T.INSP][0].fields.next_due = TY_NOW + 1;
+    DB[T.INSP][0].fields.year = TY_NOW - 1;
+    DB[T.INSP][0].fields.date = (TY_NOW - 1) + '-06-01';
+
+    const auto = await mod().buildWorklist('Culverts', null, true);
+    eq('worklist: no year asked for means the data picks one', auto.yearAuto, true);
+    eq('worklist: it opens on the year work falls DUE, not the current year',
+       auto.year, TY_NOW + 1);
+    eq('worklist: the current year has nothing coming due',
+       auto.years.find(p => p.year === TY_NOW).due, 0);
+    ok('worklist: and the chosen year does', auto.counts.due > 0, 'due ' + auto.counts.due);
+    ok('worklist: the backlog is carried into the chosen year, not hidden by skipping',
+       auto.counts.never > 0, 'never ' + auto.counts.never);
+    ok('worklist: the plan is returned so the page can build a selector',
+       Array.isArray(auto.years) && auto.years.length >= 2);
+    eq('worklist: every plan entry carries its own outstanding count',
+       auto.years.every(p => p.outstanding === p.never + p.overdue + p.due), true);
+    eq('worklist: the chosen year is the one the states were computed against',
+       auto.counts.due, auto.years.find(p => p.year === auto.year).due);
+
+    // An explicit year still wins over the rule, or a shared link retargets itself.
+    const pinned = await mod().buildWorklist('Culverts', TY_NOW, true);
+    eq('worklist: an explicit current year is obeyed', pinned.year, TY_NOW);
+    eq('worklist: and reported as asked-for', pinned.yearAuto, false);
+    eq('worklist: its states follow that year', pinned.counts.due, 0);
+
+    // Through the HTTP handler, which is the only path the page ever takes. Testing
+    // buildWorklist alone leaves the handler free to default year= behind its back.
+    const noYear = await call({ query: { worklist: 'Culvert', fresh: '1' } });
+    eq('handler: no year= at all reaches the rule', noYear.body.yearAuto, true);
+    eq('handler: and lands on the year work falls due', noYear.body.year, TY_NOW + 1);
+    const thisY = await call({ query: { worklist: 'Culvert', year: String(TY_NOW), fresh: '1' } });
+    eq('handler: an explicit year= is honoured', thisY.body.year, TY_NOW);
+    eq('handler: and marked as asked-for', thisY.body.yearAuto, false);
+    const junkY = await call({ query: { worklist: 'Culvert', year: 'soon', fresh: '1' } });
+    eq('handler: an unparseable year= falls back to this year, not to the rule',
+       junkY.body.year, TY_NOW);
+    eq('handler: and is still not treated as automatic', junkY.body.yearAuto, false);
+    resetDb();
+  }
+
+  // ── cache headers ──────────────────────────────────────────────────────────
+  // Every 200 from this endpoint is behind a session, so none of them may be stored
+  // by a shared cache. These were `public` until 2026-09-02 and the mistake hid a
+  // real check: an unauthenticated probe came back 200 because the BROWSER served it
+  // the cached body of an earlier authenticated call, which looked exactly like a
+  // broken auth guard. The guard was fine. The header was not.
+  {
+    resetDb();
+    const cc = r => r.headers['Cache-Control'];
+    const paths = [
+      ['worklist',  { worklist: 'Culvert' }],
+      ['criteria',  { criteria: 'OMM 303' }],
+      ['one asset', { asset: 'MRDC-CV-1' }],
+      ['summary',   { summary: '1' }],
+    ];
+    for (const [name, query] of paths) {
+      const r = await call({ query });
+      ok(`${name}: 200 so the header is meaningful`, r.statusCode === 200, 'got ' + r.statusCode);
+      ok(`${name}: Cache-Control is set at all`, !!cc(r), JSON.stringify(r.headers));
+      ok(`${name}: is PRIVATE, never public`, /(^|[\s,])private([\s,;]|$)/.test(cc(r) || ''), cc(r));
+      ok(`${name}: does not say public`, !/public/.test(cc(r) || ''), cc(r));
+    }
+    // ?fresh=1 must defeat the cache entirely — this is what makes an authenticated
+    // re-check trustworthy, and what proved the auth guard was intact.
+    for (const [name, query] of paths) {
+      const r = await call({ query: Object.assign({ fresh: '1' }, query) });
+      eq(`${name}: fresh=1 is no-store`, cc(r), 'no-store');
+    }
+  }
 
   // ── guards ─────────────────────────────────────────────────────────────────
   SESSION = null;
@@ -311,6 +443,93 @@ function mod() {
   eq('post: segment carries km_end', SEG.km_end, 305);
   eq('post: segment has no asset link', SEG.asset, undefined);
   eq('post: annual programme uses a 1-year cycle', SEG.cycle, 'Annual');
+
+  // ── the asset card (2026-09-02) ───────────────────────────────────────────
+  {
+    const M2 = mod();
+    const slots = M2.slotsFor('Culvert');
+    eq('a culvert has three photo slots — both ends get checked', slots.map(s => s[0]),
+       ['photo_eb_url','photo_wb_url','photo_median_url']);
+    eq('and they are labelled for a person', slots.map(s => s[1]), ['EB end','WB end','Median']);
+    eq('an unknown type has no slots rather than guessing', M2.slotsFor('Pavement'), []);
+    ok('the detail field list pulls the photo and summary columns too',
+       M2.detailFieldList('Culvert').includes('photo_median_url') &&
+       M2.detailFieldList('Culvert').includes('crossing_name') &&
+       M2.detailFieldList('Culvert').includes('maintenance_responsibility'));
+    const card = M2.assetCard('Culvert', { photo_eb_url: 'a.png', crossing_name: 'Kelly Brook',
+                                           type: 'Culvert', height_mm: '' });
+    eq('every slot is offered, empty ones included so they can be filled', card.photos.length, 3);
+    eq('a slot with no photo reports null, not a broken image', card.photos[1].url, null);
+    ok('a summary field with no value is left out entirely',
+       !card.summary.some(x => x.field === 'height_mm'), JSON.stringify(card.summary));
+    ok('and one with a value is shown with its label',
+       card.summary.some(x => x.label === 'Crossing' && x.value === 'Kelly Brook'));
+  }
+
+  resetDb();
+  r = await call({ query: { rec: 'recA2' } });
+  eq('the asset lookup returns the card', r.statusCode, 200);
+  eq('with all three photo slots', (r.body.card.photos || []).length, 3);
+  eq('the EB slot carries the photo on file', r.body.card.photos[0].url, 'https://res.cloudinary.com/x/eb-old.png');
+  eq('the WB slot is empty and says so', r.body.card.photos[1].url, null);
+  ok('the summary names the crossing', r.body.card.summary.some(x => x.value === 'Tributary of Taylor’s Brook'));
+  eq('an unambiguous asset is not flagged ambiguous', r.body.card.ambiguous, 0);
+
+  // ── filing WITH end photos ────────────────────────────────────────────────
+  resetDb();
+  r = await call({ method: 'POST', body: { programme: 'Culverts', rec: 'recA2', date: '2027-05-20',
+    checks: [{ check_ref: 'q01', state: 'pass' }],
+    photos: { photo_eb_url: 'https://c/new-eb.png', photo_median_url: 'https://c/new-med.png' } } });
+  eq('an inspection with end photos files', r.statusCode, 201);
+  const PF = WRITES.find(w => w.table === T.INSP).body.records[0].fields;
+  eq('the EB photo is stored on the inspection', PF.photo_eb_url, 'https://c/new-eb.png');
+  eq('the median photo too', PF.photo_median_url, 'https://c/new-med.png');
+  eq('a slot not photographed is not invented', PF.photo_wb_url, undefined);
+  eq('and it records that the asset was NOT refreshed', PF.asset_photos_updated, 'No');
+  ok('no detail row was touched', !WRITES.some(w => w.table === T.CULV));
+
+  // ── filing WITH the asset refresh ─────────────────────────────────────────
+  resetDb();
+  r = await call({ method: 'POST', body: { programme: 'Culverts', rec: 'recA2', date: '2027-05-20',
+    checks: [{ check_ref: 'q01', state: 'pass' }],
+    photos: { photo_eb_url: 'https://c/new-eb.png' }, update_asset_photos: true } });
+  eq('the inspection still files', r.statusCode, 201);
+  eq('the flag records that the asset was refreshed',
+     WRITES.find(w => w.table === T.INSP).body.records[0].fields.asset_photos_updated, 'Yes');
+  const patch = WRITES.find(w => w.table === T.CULV && w.method === 'PATCH');
+  ok('the detail row is PATCHed', !!patch);
+  eq('with only the slot that was photographed', Object.keys(patch.body.fields), ['photo_eb_url']);
+  eq('and the new url', patch.body.fields.photo_eb_url, 'https://c/new-eb.png');
+  eq('the response names what it changed', r.body.assetPhotos, ['photo_eb_url']);
+  eq('the inspection KEEPS its own copy, so history survives',
+     WRITES.find(w => w.table === T.INSP).body.records[0].fields.photo_eb_url, 'https://c/new-eb.png');
+
+  // ── an ambiguous asset_id must not have a photo written onto a guess ───────
+  resetDb();
+  r = await call({ method: 'POST', body: { programme: 'Culverts', rec: 'recD1', date: '2027-05-20',
+    checks: [{ check_ref: 'q01', state: 'pass' }],
+    photos: { photo_eb_url: 'https://c/new-eb.png' }, update_asset_photos: true } });
+  eq('the inspection is still saved', r.statusCode, 201);
+  ok('but the asset photo is refused and says why', /shared by 2 detail rows/.test(r.body.assetPhotoError || ''), r.body.assetPhotoError);
+  ok('and nothing was PATCHed', !WRITES.some(w => w.method === 'PATCH'));
+
+  // ── a failed asset-photo write must not lose the inspection ───────────────
+  resetDb();
+  FAIL_ON = { table: T.CULV, method: 'PATCH', status: 422, message: 'nope' };
+  r = await call({ method: 'POST', body: { programme: 'Culverts', rec: 'recA2', date: '2027-05-20',
+    checks: [{ check_ref: 'q01', state: 'pass' }],
+    photos: { photo_eb_url: 'https://c/new-eb.png' }, update_asset_photos: true } });
+  eq('a failed asset-photo write still files the inspection', r.statusCode, 201);
+  ok('and reports the failure rather than pretending', !!r.body.assetPhotoError);
+  FAIL_ON = null;
+
+  // ── asking for the refresh with no photos changes nothing ─────────────────
+  resetDb();
+  r = await call({ method: 'POST', body: { programme: 'Culverts', rec: 'recA2', date: '2027-05-20',
+    checks: [{ check_ref: 'q01', state: 'pass' }], update_asset_photos: true } });
+  ok('asking to refresh with no photos patches nothing', !WRITES.some(w => w.method === 'PATCH'));
+  eq('and does not claim the asset was updated',
+     WRITES.find(w => w.table === T.INSP).body.records[0].fields.asset_photos_updated, undefined);
 
   // ⚠️ Added after mutation testing: replacing `year + prog.years` with `year + 2`
   // survived, because every POST test above used a BIENNIAL programme where the two

@@ -602,6 +602,32 @@ function applyCors(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-user-role, x-app-role, x-user-id, x-user-name');
 }
 
+/* ⚠️ EVERY CACHEABLE RESPONSE FROM HERE IS "private", AND THAT IS NOT A
+   PREFERENCE. Access-Control-Allow-Origin above is REFLECTED — it names one
+   caller, so two callers get two different responses from the same URL. Vary:
+   Origin is the header that is supposed to keep them apart, and a browser does
+   honour it; a shared cache in front of this function is not obliged to, and
+   Vercel's edge does not.
+
+   What that cost, found in production on 2026-09-22: the patrol form on
+   www.mrdc-htra.com could not load the asset register at all — "Failed to
+   fetch", no detail, and every deficiency row reading "the asset register has
+   not loaded", which looks exactly like no signal. The DMT on
+   dmt.mrdc-htra.com had fetched ?all=1 a moment earlier; the edge kept that
+   response, Allow-Origin and all, and handed it to www, whose browser refused
+   it. Fetch ?all=1 from one, then the other, and it swaps over — whichever
+   origin warmed it last works and the other silently gets nothing. A patroller
+   never sees it; a supervisor with both apps open breaks the patrol form every
+   time they touch the DMT.
+
+   "private" says: a browser may keep this, a shared cache may not. The reader
+   keeps its five minutes; nothing in between keeps anything. A conditional
+   request is not a way out — a 304 reuses the STORED headers, which are the
+   wrong caller's.
+
+   ⚠️ So: if a response here carries a reflected Allow-Origin, it must not be
+   "public". Adding a new cacheable branch below means adding a private one. */
+
 // ── Creating an asset ───────────────────────────────────────────────────────
 // The one place a new federation key enters the register, so the guards here matter
 // more than anywhere else in this file:
@@ -866,7 +892,7 @@ module.exports = async function handler(req, res) {
           bt[g.key] = (bt[g.key] || 0) + 1;
         }
       }
-      res.setHeader('Cache-Control', 'public, max-age=60');
+      res.setHeader('Cache-Control', 'private, max-age=60');
       return res.status(200).json({
         total: rows.length,
         gaps: GAPS.map(g => ({ key: g.key, label: g.label, count: totals[g.key] })),
@@ -885,7 +911,7 @@ module.exports = async function handler(req, res) {
       if (!table) return res.status(400).json({ error: `"${type}" is not a known asset type.`, types: Object.keys(DETAIL_TABLE) });
       let names = [];
       try { names = await detailFieldNames(table); } catch (_) { names = []; }
-      res.setHeader('Cache-Control', 'public, max-age=300');
+      res.setHeader('Cache-Control', 'private, max-age=300');
       // numeric/checkbox tell the ADD form which of these plain-named fields need a
       // number or checkbox input instead of free text - without this the create form
       // cannot tell a Number column from a text one, which is how a typed-in
@@ -908,7 +934,7 @@ module.exports = async function handler(req, res) {
       }
       const list = Object.entries(tally).sort((x, y) => y[1] - x[1])
         .map(([category, count]) => ({ category, count }));
-      res.setHeader('Cache-Control', 'public, max-age=300');
+      res.setHeader('Cache-Control', 'private, max-age=300');
       return res.status(200).json({ total: register.length, types: list });
     }
 
@@ -923,8 +949,10 @@ module.exports = async function handler(req, res) {
     //
     // Saving an edit and seeing the OLD values come back had TWO causes, and fixing
     // only one would have left the bug intermittent:
-    //   1. This response used to be `Cache-Control: public, max-age=300`, so the
-    //      BROWSER served the pre-edit body for five minutes.
+    //   1. This response used to be cacheable for five minutes, so the BROWSER
+    //      served the pre-edit body for that long. (Every cacheable response here
+    //      is "private" now — see applyCors — but private still means the browser
+    //      may keep it, so ?fresh=1 is still what bypasses it.)
     //   2. `CACHE` is per-lambda-instance memory. handlePatch clears it in the
     //      instance that handled the PATCH; the GET that follows can land on a
     //      DIFFERENT warm instance still holding a five-minute-old register. No
@@ -947,7 +975,7 @@ module.exports = async function handler(req, res) {
           if (shaped) one = shaped;
         } catch (_) { /* fall back to the cached row rather than 404 a record that exists */ }
       }
-      res.setHeader('Cache-Control', fresh ? 'no-store' : 'public, max-age=300');
+      res.setHeader('Cache-Control', fresh ? 'no-store' : 'private, max-age=300');
       if (!one) return res.status(404).json({ error: 'Asset not found', id: String(rec || id) });
       // Every record sharing this asset_id, so the page can say so out loud instead
       // of silently showing one of several. Always computed from the asset actually
@@ -989,7 +1017,7 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.setHeader('Cache-Control', 'private, max-age=300');
     return res.status(200).json(register);
   } catch (e) {
     console.error('assets endpoint error:', e);
