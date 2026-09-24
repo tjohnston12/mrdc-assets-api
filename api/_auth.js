@@ -12,6 +12,20 @@
 //
 // Only asset-message.js uses this today. Moving assets.js and media.js onto it is
 // the real fix for §7 and is deliberately NOT bundled into this change.
+//
+// ── 2026-09-23: that move happened. assets.js, media.js and inspections.js now
+// use this file too, so what follows was added for them.
+//
+// ⚠️ orgRole AND appRole ARE BOTH EXPOSED, SEPARATELY. The `role` field below
+// collapses them (app role for staff, Admins-table role for contractors), which
+// is all asset-message needed. The assets/media gates need both halves:
+//     canEdit = orgRole Owner/Admin  OR  appRole Admin/Manager
+// and auth does NOT promote an Owner to an app Admin — appRoleForEmployee()
+// returns the per-app field if set, otherwise plain 'User'. So an Owner with no
+// Assets Role resolves to appRole 'User', and a gate reading only the collapsed
+// `role` would LOCK THAT OWNER OUT of a registry they can edit today.
+// (working-agreement §6d says an Owner maps to 'Admin' in every app; the auth
+// _lib.js does not do that. Verified 2026-09-23.)
 
 const AUTH_URL = process.env.AUTH_URL || 'https://auth.mrdc-htra.com';
 const APP      = process.env.AUTH_APP || 'Assets';
@@ -46,7 +60,66 @@ async function getCaller(req) {
     ? (d.user.role || 'Contractor')
     : (d.appRole || 'User');
 
-  return { user: d.user, apps: Array.isArray(d.apps) ? d.apps : [], role, allowed: d.allowed !== false };
+  const orgRole = d.user.role || '';
+  const appRole = d.appRole || '';
+  const isStaff = d.user.source === 'employee';
+
+  /* The three gates assets.js has always had, reproduced exactly — from the
+     validated session instead of from x-user-* headers. They differ on purpose
+     and §2b says to keep the names apart:
+       · canEdit   — correct an asset that exists. Assets MANAGER included.
+       · canCreate — mint a new federation key. Manager NOT included
+                     (Troy, 2026-08-26: "for owner and admin only").
+       · canAdmin  — write the provenance fields. Same rule as canCreate.
+     ⚠️ Guarded on isStaff: an Admins-table session carries a third vocabulary
+     (`Contractor`), and a contractor must never edit the registry. */
+  const orgAdmin = isStaff && (orgRole === 'Owner' || orgRole === 'Admin');
+
+  return {
+    user: d.user,
+    apps: Array.isArray(d.apps) ? d.apps : [],
+    role, orgRole, appRole, isStaff,
+    isService: false,
+    name: d.user.name || '',
+    canEdit:   orgAdmin || (isStaff && (appRole === 'Admin' || appRole === 'Manager')),
+    canCreate: orgAdmin || (isStaff && appRole === 'Admin'),
+    canAdmin:  orgAdmin || (isStaff && appRole === 'Admin'),
+    allowed: d.allowed !== false,
+  };
+}
+
+/* The service key, for the one machine that reads this API: DMT Tool's
+   api/intake.js fetches `?id=<assetId>` server-side while raising a work order.
+   It has no browser and no cookie.
+
+   ⚠️ Never compared when unset — `!!SERVICE_KEY &&` is what stops an
+   unconfigured deployment matching a caller that also sends nothing (§2b, "an
+   auth guard conditional on a secret existing is not a guard"). Same header and
+   variable name as NC's nc-intake and the DMT's, so there is one spelling. */
+const SERVICE_KEY = (process.env.INTAKE_SECRET || '').trim();
+
+const SERVICE_CALLER = Object.freeze({
+  isService: true, name: 'DMT intake',
+  role: '', orgRole: '', appRole: '', isStaff: false,
+  // A machine reads the register. It never edits it.
+  canEdit: false, canCreate: false, canAdmin: false,
+  allowed: true,
+});
+
+function hasServiceKey(req) {
+  const supplied = String(req.headers['x-intake-key'] || '');
+  return !!SERVICE_KEY && supplied === SERVICE_KEY;
+}
+
+/* A signed-in person with Assets access, OR the DMT intake machine.
+   ⚠️ Call BEFORE the handler's try/catch, or the 401 is swallowed and
+   re-reported as a 500 (§2b). */
+async function requireCallerOrService(req, res) {
+  const caller = await getCaller(req);
+  if (caller && caller.allowed) return caller;
+  if (hasServiceKey(req)) return SERVICE_CALLER;
+  res.status(401).json({ error: 'Not signed in.' });
+  return null;
 }
 
 // Any signed-in person WITH Assets access. Asking a question about an asset is not
@@ -61,4 +134,7 @@ async function requireSession(req, res) {
   return caller;
 }
 
-module.exports = { getCaller, requireSession, applyCors, APP, ORIGIN };
+module.exports = {
+  getCaller, requireSession, requireCallerOrService, hasServiceKey,
+  applyCors, APP, ORIGIN, SERVICE_CALLER,
+};

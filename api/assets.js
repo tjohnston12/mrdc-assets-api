@@ -27,6 +27,10 @@
 //   Deploy, then GET /api/assets?debug=1  → returns the table name and the exact
 //   column names of the first record, so the field map above can be set correctly.
 
+// Server-side identity: the shared htra_session cookie, validated by the auth
+// service. Replaced the spoofable x-user-* headers on 2026-09-23.
+const { requireCallerOrService } = require('./_auth');
+
 const PAT   = process.env.ASSETS_PAT || process.env.AIRTABLE_PAT;
 const BASE  = process.env.ASSETS_BASE  || 'app0sXrUbOBr7a6vV';
 const TABLE = process.env.ASSETS_TABLE || 'Assets';
@@ -466,17 +470,16 @@ function coreChoices(register) {
 }
 
 // ── Writing ─────────────────────────────────────────────────────────────────
-// Who may edit. Same shape as the other apps: identity arrives as x-user-* headers
-// set by the page after htra-auth resolves the session.
-//   !! Those headers are SPOOFABLE (working-agreement.md S7). This is a rollout
-//   gate, not a security boundary. It matters more here than elsewhere because the
-//   registry is the key every other app federates on - signed tokens are the real
-//   fix when there is appetite for it.
-function canEdit(req) {
-  const role    = String(req.headers['x-user-role'] || '');
-  const appRole = String(req.headers['x-app-role']  || '');
-  return role === 'Owner' || role === 'Admin' || appRole === 'Admin' || appRole === 'Manager';
-}
+/* Who may edit. 2026-09-23: this is now a security boundary rather than a
+   rollout gate. It used to read x-user-role / x-app-role — headers the caller
+   sets — and said so in this comment, citing §7. The rule is UNCHANGED; only
+   where the two roles come from has changed. They are computed once in
+   ./_auth.js from the validated session and reach here on `caller`.
+
+   ⚠️ BOTH halves are still needed. auth does not promote an Owner to an app
+   Admin — an Owner with no Assets Role resolves to appRole 'User' — so a gate
+   reading the per-app role alone would lock that Owner out of the registry. */
+function canEdit(caller) { return !!caller && caller.canEdit === true; }
 
 // Editable core fields. Identity and provenance are deliberately NOT here:
 //   asset_id    - the foreign key every NC and work order stores as text. Changing
@@ -488,11 +491,7 @@ function canEdit(req) {
 // Assets Admin / Assets Manager; creating is Owner / org Admin / Assets Admin only
 // (Troy, 2026-08-26: "an add asset button ... for owner and admin only"). A Manager
 // can still correct an asset that exists — they just cannot mint a new federation key.
-function canCreate(req) {
-  const role    = String(req.headers['x-user-role'] || '');
-  const appRole = String(req.headers['x-app-role']  || '');
-  return role === 'Owner' || role === 'Admin' || appRole === 'Admin';
-}
+function canCreate(caller) { return !!caller && caller.canCreate === true; }
 
 const CORE_WRITABLE = new Set([
   'name', 'description', 'route', 'km_start', 'km_end', 'direction', 'side',
@@ -517,11 +516,7 @@ const CORE_NUMERIC = new Set(['km_start', 'km_end', 'lat', 'lng']);
 // ⚠️ asset_id and asset_type are NOT here. Both are still refused, and deliberately -
 // see the note on handlePatch. They are identity and structure, not description.
 const ADMIN_WRITABLE = new Set(['asset_ref', 'source_ref', 'source_system']);
-function canAdmin(req) {
-  const role    = String(req.headers['x-user-role'] || '');
-  const appRole = String(req.headers['x-app-role']  || '');
-  return role === 'Owner' || role === 'Admin' || appRole === 'Admin';
-}
+function canAdmin(caller) { return !!caller && caller.canAdmin === true; }
 // On a detail row everything is an attribute of the asset EXCEPT the join key, the
 // link column, and the photo urls (managed by the photo flow, not typed by hand).
 // asset_ref and source_ref also appear on some detail tables. They are locked on
@@ -596,9 +591,21 @@ const ORIGIN_OK = /^https:\/\/([a-z0-9-]+\.)*mrdc-htra\.com$|^https:\/\/[a-z0-9-
 function applyCors(req, res) {
   const origin = req.headers?.origin;
   // server-to-server calls (e.g. DMT intake) send no Origin — nothing to set.
-  if (origin && ORIGIN_OK.test(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+  if (origin && ORIGIN_OK.test(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    /* ⚠️ Required for the cookie to travel. Every browser caller of this API is
+       CROSS-origin — the Assets, Media, Inspections, DMT and patrol pages are
+       all served from somewhere else — so without this the session never
+       arrives and every signed-in request reads as anonymous. A wildcard origin
+       is illegal on a credentialed request, which is why this sits inside the
+       allow-list branch rather than beside it. */
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
   res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, PATCH, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS');
+  /* ⚠️ x-user-* stays in the allow-list although nothing reads it any more: the
+     pages still attach those headers, and dropping them here fails the preflight
+     before the request is sent. Page first, then this list — never the reverse. */
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-user-role, x-app-role, x-user-id, x-user-name');
 }
 
@@ -637,9 +644,22 @@ function applyCors(req, res) {
 
    ⚠️ Adding a cacheable branch below means passing its value through
    cacheFor(), not calling setHeader('Cache-Control', …) directly. */
-function cacheFor(res, value) {
-  res.setHeader('Cache-Control',
-    res.getHeader('Access-Control-Allow-Origin') ? 'no-store' : value);
+/* ⚠️ The origin half is the 2026-09-22 rule and is what actually protects this
+   API today: every browser caller here is CROSS-origin, so a reflected origin
+   already forces no-store on every signed-in response, and the only caller that
+   reflects nothing is the DMT intake machine — genuinely the same for everybody,
+   so its cache is kept.
+
+   The caller half is DEFENCE, not a live fix, and it is currently unreachable:
+   it would only bite if a page were ever served from assets.mrdc-htra.com
+   itself. That is exactly how the DMT got caught on 2026-09-23 — its page IS
+   same-origin, so it sent no Origin, and an authenticated response went into a
+   shared edge cache. Cheap to make the invariant explicit rather than leave it
+   true by accident of where the front-end happens to live. */
+function cacheFor(res, value, caller) {
+  const perCaller = !!res.getHeader('Access-Control-Allow-Origin')
+                 || !!(caller && !caller.isService);
+  res.setHeader('Cache-Control', perCaller ? 'no-store' : value);
 }
 
 // ── Creating an asset ───────────────────────────────────────────────────────
@@ -656,8 +676,8 @@ function cacheFor(res, value) {
 const CREATE_WRITABLE = new Set([...CORE_WRITABLE, 'asset_id', 'asset_type', 'asset_ref',
                                  'tagged_marked', 'tag_marking']);
 
-async function handleCreate(req, res) {
-  if (!canCreate(req)) {
+async function handleCreate(req, res, caller) {
+  if (!canCreate(caller)) {
     return res.status(403).json({ error: 'Only an Owner or an Admin can add an asset.' });
   }
   let body = req.body;
@@ -676,7 +696,12 @@ async function handleCreate(req, res) {
     });
   }
 
-  const actor = String(req.headers['x-user-name'] || '').trim() || 'unknown';
+  /* ⚠️ From the validated session, never from x-user-name. This is written to
+     last_edited_by on the registry, so a header here let anyone attribute an
+     edit to a colleague — the same shape as the DMT's email `sentBy` and
+     media.js's own stamp. Missed on the first pass of this change and caught by
+     _tests/test-assets-auth.js's "reads no x-user-* header" assertion. */
+  const actor = String(caller.name || '').trim() || (caller.isService ? 'DMT intake' : 'unknown');
   const stamp = new Date().toISOString();
 
   try {
@@ -757,14 +782,19 @@ async function handleCreate(req, res) {
   }
 }
 
-async function handlePatch(req, res) {
-  if (!canEdit(req)) return res.status(403).json({ error: 'You do not have edit rights for Assets.' });
+async function handlePatch(req, res, caller) {
+  if (!canEdit(caller)) return res.status(403).json({ error: 'You do not have edit rights for Assets.' });
 
   let body = req.body;
   if (typeof body === 'string') { try { body = JSON.parse(body); } catch (_) { body = null; } }
   if (!body || (!body.rec && !body.id)) return res.status(400).json({ error: 'rec (or id) is required' });
 
-  const actor = String(req.headers['x-user-name'] || '').trim() || 'unknown';
+  /* ⚠️ From the validated session, never from x-user-name. This is written to
+     last_edited_by on the registry, so a header here let anyone attribute an
+     edit to a colleague — the same shape as the DMT's email `sentBy` and
+     media.js's own stamp. Missed on the first pass of this change and caught by
+     _tests/test-assets-auth.js's "reads no x-user-* header" assertion. */
+  const actor = String(caller.name || '').trim() || (caller.isService ? 'DMT intake' : 'unknown');
   const stamp = new Date().toISOString();
 
   try {
@@ -795,7 +825,7 @@ async function handlePatch(req, res) {
       });
     }
 
-    const admin = canAdmin(req);
+    const admin = canAdmin(caller);
     const allow = admin ? new Set([...CORE_WRITABLE, ...ADMIN_WRITABLE]) : CORE_WRITABLE;
     const core = cleanWrite(body.core, allow, CORE_NUMERIC, admin);
     const det  = cleanWrite(body.detail, null,
@@ -851,8 +881,18 @@ async function handlePatch(req, res) {
 module.exports = async function handler(req, res) {
   applyCors(req, res);
   if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method === 'PATCH') return handlePatch(req, res);
-  if (req.method === 'POST')  return handleCreate(req, res);
+
+  /* ⚠️ Identity BEFORE anything else, and before the try below — a 401 raised
+     inside it would be caught and re-reported as a 500 (§2b).
+
+     The service key is accepted because DMT Tool's api/intake.js reads
+     `?id=<assetId>` from this API server-side while raising a work order. It
+     gets no edit rights: SERVICE_CALLER has canEdit/canCreate/canAdmin false. */
+  const caller = await requireCallerOrService(req, res);
+  if (!caller) return;
+
+  if (req.method === 'PATCH') return handlePatch(req, res, caller);
+  if (req.method === 'POST')  return handleCreate(req, res, caller);
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
@@ -906,7 +946,7 @@ module.exports = async function handler(req, res) {
           bt[g.key] = (bt[g.key] || 0) + 1;
         }
       }
-      cacheFor(res, 'public, max-age=60');
+      cacheFor(res, 'public, max-age=60', caller);
       return res.status(200).json({
         total: rows.length,
         gaps: GAPS.map(g => ({ key: g.key, label: g.label, count: totals[g.key] })),
@@ -925,7 +965,7 @@ module.exports = async function handler(req, res) {
       if (!table) return res.status(400).json({ error: `"${type}" is not a known asset type.`, types: Object.keys(DETAIL_TABLE) });
       let names = [];
       try { names = await detailFieldNames(table); } catch (_) { names = []; }
-      cacheFor(res, 'public, max-age=300');
+      cacheFor(res, 'public, max-age=300', caller);
       // numeric/checkbox tell the ADD form which of these plain-named fields need a
       // number or checkbox input instead of free text - without this the create form
       // cannot tell a Number column from a text one, which is how a typed-in
@@ -948,7 +988,7 @@ module.exports = async function handler(req, res) {
       }
       const list = Object.entries(tally).sort((x, y) => y[1] - x[1])
         .map(([category, count]) => ({ category, count }));
-      cacheFor(res, 'public, max-age=300');
+      cacheFor(res, 'public, max-age=300', caller);
       return res.status(200).json({ total: register.length, types: list });
     }
 
@@ -989,7 +1029,7 @@ module.exports = async function handler(req, res) {
           if (shaped) one = shaped;
         } catch (_) { /* fall back to the cached row rather than 404 a record that exists */ }
       }
-      cacheFor(res, fresh ? 'no-store' : 'public, max-age=300');
+      cacheFor(res, fresh ? 'no-store' : 'public, max-age=300', caller);
       if (!one) return res.status(404).json({ error: 'Asset not found', id: String(rec || id) });
       // Every record sharing this asset_id, so the page can say so out loud instead
       // of silently showing one of several. Always computed from the asset actually
@@ -1031,7 +1071,7 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    cacheFor(res, 'public, max-age=300');
+    cacheFor(res, 'public, max-age=300', caller);
     return res.status(200).json(register);
   } catch (e) {
     console.error('assets endpoint error:', e);

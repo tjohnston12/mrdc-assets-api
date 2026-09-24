@@ -89,14 +89,22 @@ function headersFor(origin) {
    origin that asks. Measured in production 2026-09-22, after that deploy — a
    plain fetch of ?all=1 from dmt.mrdc-htra.com still failed while the same
    fetch with cache:'no-store' succeeded. */
-const cf = (SRC.match(/function cacheFor\(res, value\) \{[\s\S]*?\n\}/) || [''])[0];
+// ⚠️ The signature gained a `caller` on 2026-09-23. A lift keyed to the old
+// one silently yields '' and the suite then dies inside the stub without
+// printing a tally — which is how this was noticed.
+const cf = (SRC.match(/function cacheFor\(res, value[^)]*\) \{[\s\S]*?\n\}/) || [''])[0];
 ok('cacheFor() can be lifted', !!cf);
-function withCache(origin, value) {
+/* The three kinds of caller this API now has. A signed-in person is only ever
+   cross-origin here (the Assets front-end is on www.), so the origin rule is
+   what actually protects them; the caller argument is the defence branch. */
+const PERSON  = { isService: false, name: 'Someone' };
+const MACHINE = { isService: true,  name: 'DMT intake' };
+function withCache(origin, value, caller) {
   const h = {};
   const res = { setHeader: (k, v) => { h[k] = v; }, getHeader: k => h[k] };
   const req = { headers: origin === undefined ? {} : { origin } };
-  new Function('req', 'res', lifted + '\n' + cf +
-    '\napplyCors(req, res); cacheFor(res, ' + JSON.stringify(value) + ');')(req, res);
+  new Function('req', 'res', 'caller', lifted + '\n' + cf +
+    '\napplyCors(req, res); cacheFor(res, ' + JSON.stringify(value) + ', caller);')(req, res, caller);
   return h;
 }
 {
@@ -121,18 +129,33 @@ function withCache(origin, value) {
   /* ⚠️ The only setHeader('Cache-Control', …) in the file is the one inside
      cacheFor(). Any other is a branch that went round the rule. */
   const CODE = SRC.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1 ');
-  const stray = (CODE.match(/setHeader\('Cache-Control',[\s\S]{0,80}?\)/g) || [])
-    .filter(x => !/getHeader\('Access-Control-Allow-Origin'\)/.test(x));
+  /* ⚠️ Cut cacheFor's own body out FIRST, then look for strays in what is left.
+     The previous version filtered on the setHeader line containing
+     getHeader('Access-Control-Allow-Origin') — true while the decision was one
+     inline ternary, false once it moved to its own `const perCaller` line, so
+     cacheFor's own setHeader started reading as a stray. Removing the function
+     is shape-independent and says what is actually meant. */
+  const body = (CODE.match(/function cacheFor\(res, value[^)]*\) \{[\s\S]*?\n\}/) || [''])[0];
+  ok('cacheFor() can be found in order to exclude it', !!body);
+  const stray = ((CODE.split(body).join(' ')).match(/setHeader\('Cache-Control',[\s\S]{0,80}?\)/g) || []);
   eq('no Cache-Control is set outside cacheFor()', stray, []);
-  ok('every cacheable branch goes through it',
-     (SRC.match(/cacheFor\(res,/g) || []).length >= 5,
-     String((SRC.match(/cacheFor\(res,/g) || []).length));
+  // Count the CALLS, not the definition (§2b).
+  const calls = (CODE.match(/(?<!function )\bcacheFor\(res,/g) || []).length;
+  ok('every cacheable branch goes through it', calls >= 5, String(calls));
+  ok('and every one of them passes the caller',
+     (CODE.match(/(?<!function )\bcacheFor\(res,[^;]*?, caller\)/g) || []).length === calls,
+     String(calls));
+  /* Still keyed on what was actually SET rather than on req.headers.origin, so
+     it cannot drift out of step with applyCors's own allow-list. */
   ok('cacheFor decides from the header that was actually set',
-     /res\.getHeader\('Access-Control-Allow-Origin'\) \? 'no-store' :/.test(SRC));
+     /res\.getHeader\('Access-Control-Allow-Origin'\)/.test(body));
+  ok('and a signed-in caller is per-caller too',
+     /caller && !caller\.isService/.test(body),
+     'the session branch is gone — a same-origin page would be shared-cached');
   ok('the register is still the endpoint that asks for five minutes',
-     /cacheFor\(res, 'public, max-age=300'\);\n    return res\.status\(200\)\.json\(register\);/.test(SRC));
+     /cacheFor\(res, 'public, max-age=300', caller\);\n    return res\.status\(200\)\.json\(register\);/.test(SRC));
   ok('?fresh=1 still refuses a cache even for a caller that would get one',
-     /cacheFor\(res, fresh \? 'no-store' : 'public, max-age=300'\)/.test(SRC));
+     /cacheFor\(res, fresh \? 'no-store' : 'public, max-age=300', caller\)/.test(SRC));
   ok('the reason is written down beside applyCors, not only here',
      /REFLECTED/.test(SRC) && /ONE entry per URL/.test(SRC));
 }

@@ -28,7 +28,10 @@ const eq = (n, g, w) => ok(n, JSON.stringify(g) === JSON.stringify(w),
 
 const cors = (SRC.match(/const ORIGIN_OK = [^\n]*\n+function applyCors\(req, res\) \{[\s\S]*?\n\}/) || [''])[0];
 ok('applyCors() and its origin pattern can be lifted', !!cors);
-const cf = (SRC.match(/function cacheFor\(res, value\) \{[\s\S]*?\n\}/) || [''])[0];
+// ⚠️ The signature gained a `caller` on 2026-09-23. A lift keyed to the old
+// one silently yields '' and the suite then dies inside the stub without
+// printing a tally — which is how this was noticed.
+const cf = (SRC.match(/function cacheFor\(res, value[^)]*\) \{[\s\S]*?\n\}/) || [''])[0];
 ok('cacheFor() can be lifted too', !!cf);
 
 function stub(origin, tail) {

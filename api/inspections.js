@@ -25,6 +25,9 @@
 //   ASSETS_BASE                 default 'app0sXrUbOBr7a6vV'
 //   INSPECTIONS_TABLE           default 'tblOQpwrLZtyMng08'
 
+// Server-side identity — added 2026-09-23; this endpoint had none.
+const { requireCallerOrService } = require('./_auth');
+
 const PAT   = process.env.ASSETS_PAT || process.env.AIRTABLE_PAT;
 const BASE  = process.env.ASSETS_BASE || 'app0sXrUbOBr7a6vV';
 const TABLE = process.env.INSPECTIONS_TABLE || 'tblOQpwrLZtyMng08';
@@ -33,7 +36,11 @@ const ORIGIN_OK = /^https:\/\/([a-z0-9-]+\.)*mrdc-htra\.com$|^https:\/\/[a-z0-9-
 
 function applyCors(req, res) {
   const origin = req.headers?.origin;
-  if (origin && ORIGIN_OK.test(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+  if (origin && ORIGIN_OK.test(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    // ⚠️ Required for the cookie to travel — every caller is cross-origin.
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -47,7 +54,9 @@ function applyCors(req, res) {
    its cache. The long version is in assets.js.
 
    ⚠️ A new cacheable branch passes its value through cacheFor(). */
-function cacheFor(res, value) {
+/* ⚠️ See the long note on this helper in api/assets.js. The caller half is
+   defence — every caller of this endpoint is cross-origin today. */
+function cacheFor(res, value, caller) {
   res.setHeader('Cache-Control',
     res.getHeader('Access-Control-Allow-Origin') ? 'no-store' : value);
 }
@@ -171,6 +180,13 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
+  /* ⚠️ This endpoint had NO authentication of any kind until 2026-09-23 — not
+     even the spoofable headers the rest of the repo used. Anyone reaching the
+     URL could read the whole inspection history. Identity before the work, and
+     before any try/catch, so a 401 is not re-reported as a 500 (§2b). */
+  const caller = await requireCallerOrService(req, res);
+  if (!caller) return;
+
   if (!PAT) return res.status(500).json({ error: 'Inspections API is not configured (no PAT).' });
 
   const q = req.query || {};
@@ -188,7 +204,7 @@ module.exports = async function handler(req, res) {
         byAsset[id] = { count: e.count, lastYear: e.lastYear, nextDue: e.nextDue,
                         state: e.state, withReport: e.withReport, standards: e.standards };
       }
-      cacheFor(res, 'public, max-age=60');
+      cacheFor(res, 'public, max-age=60', caller);
       return res.status(200).json({ total: rows.length, assets: Object.keys(byAsset).length, thisYear, byAsset });
     }
 
@@ -207,7 +223,7 @@ module.exports = async function handler(req, res) {
         if (g && g.year === r.year) g.rows.push(r);
         else years.push({ year: r.year, rows: [r] });
       }
-      cacheFor(res, 'public, max-age=60');
+      cacheFor(res, 'public, max-age=60', caller);
       return res.status(200).json({
         asset_id: asset, thisYear,
         count: rows.length,

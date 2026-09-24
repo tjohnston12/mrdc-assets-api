@@ -29,6 +29,10 @@
 //
 // NO external dependencies.
 
+// Server-side identity: the shared htra_session cookie, validated by the auth
+// service. Replaced the spoofable x-user-* headers on 2026-09-23.
+const { requireCallerOrService } = require('./_auth');
+
 const PAT          = process.env.ASSETS_PAT || process.env.AIRTABLE_PAT;
 const BASE         = process.env.ASSETS_BASE || 'app0sXrUbOBr7a6vV';
 const TABLE        = process.env.MEDIA_TABLE || 'Media';
@@ -238,16 +242,14 @@ function buildStats(rows) {
 
 // ── Writing ─────────────────────────────────────────────────────────────────
 
-// Identity arrives as x-user-* headers set by the page once htra-auth resolves the
-// session. Same gate as api/assets.js — this app reuses the Assets Role rather
-// than adding a parallel one.
-//   !! Those headers are SPOOFABLE (working-agreement.md §7). This is a rollout
-//   gate, not a security boundary.
-function canEdit(req) {
-  const role    = String(req.headers['x-user-role'] || '');
-  const appRole = String(req.headers['x-app-role']  || '');
-  return role === 'Owner' || role === 'Admin' || appRole === 'Admin' || appRole === 'Manager';
-}
+/* Same gate as api/assets.js — Media reuses the Assets Role rather than adding a
+   parallel one, and Media has no App Access choice of its own: the page declares
+   data-app="Assets" and rides on Assets access (§2b).
+
+   2026-09-23: computed in ./_auth.js from the validated session instead of from
+   x-user-* headers the caller sets. The RULE is unchanged — Owner / org Admin /
+   Assets Admin / Assets Manager. */
+function canEdit(caller) { return !!caller && caller.canEdit === true; }
 
 const WRITABLE = new Set([
   'title', 'media_type', 'capture_method', 'scope', 'asset_id', 'route',
@@ -330,15 +332,18 @@ function validateForSave(fields, isCreate, existing) {
   return problems;
 }
 
-async function handleWrite(req, res, method) {
-  if (!canEdit(req)) {
+async function handleWrite(req, res, method, caller) {
+  if (!canEdit(caller)) {
     return res.status(403).json({ error: 'You do not have rights to file media. Ask an Assets Admin or Manager.' });
   }
   let body = req.body;
   if (typeof body === 'string') { try { body = JSON.parse(body); } catch (_) { body = null; } }
   if (!body || typeof body !== 'object') return res.status(400).json({ error: 'Expected a JSON body.' });
 
-  const actor = String(req.headers['x-user-name'] || '').trim() || 'unknown';
+  /* ⚠️ From the validated session, never from x-user-name. This is stamped into
+     added_by / last_edited_by, so a header here let anyone file a media row
+     under a colleague's name — the same shape as the DMT's email `sentBy`. */
+  const actor = String(caller.name || '').trim() || (caller.isService ? 'DMT intake' : 'unknown');
   const { fields, rejected } = cleanWrite(body.fields || body);
 
   try {
@@ -446,7 +451,13 @@ async function people() {
 const ORIGIN_OK = /^https:\/\/([a-z0-9-]+\.)*mrdc-htra\.com$|^https:\/\/[a-z0-9-]+\.vercel\.app$/i;
 function applyCors(req, res) {
   const origin = req.headers.origin;
-  if (origin && ORIGIN_OK.test(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+  if (origin && ORIGIN_OK.test(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    // ⚠️ Required for the cookie to travel — every Media caller is cross-origin.
+    // A wildcard origin is illegal on a credentialed request, hence inside the
+    // allow-list branch. See the fuller note in api/assets.js.
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-user-role, x-app-role, x-user-id, x-user-name');
@@ -460,7 +471,10 @@ function applyCors(req, res) {
    its cache. The long version is in assets.js.
 
    ⚠️ A new cacheable branch passes its value through cacheFor(). */
-function cacheFor(res, value) {
+/* ⚠️ See the long note on this helper in api/assets.js. The origin half is what
+   protects this API — every Media caller is cross-origin. The caller half is
+   defence against a page ever being served from assets.mrdc-htra.com itself. */
+function cacheFor(res, value, caller) {
   res.setHeader('Cache-Control',
     res.getHeader('Access-Control-Allow-Origin') ? 'no-store' : value);
 }
@@ -470,8 +484,16 @@ function cacheFor(res, value) {
 module.exports = async function handler(req, res) {
   applyCors(req, res);
   if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method === 'POST')  return handleWrite(req, res, 'POST');
-  if (req.method === 'PATCH') return handleWrite(req, res, 'PATCH');
+
+  /* ⚠️ Identity before anything else, and before any try/catch — a 401 raised
+     inside one is swallowed and re-reported as a 500 (§2b). Media has no
+     machine caller of its own, but it shares _auth with assets.js, so the
+     service key resolves here too and is simply not an editor. */
+  const caller = await requireCallerOrService(req, res);
+  if (!caller) return;
+
+  if (req.method === 'POST')  return handleWrite(req, res, 'POST', caller);
+  if (req.method === 'PATCH') return handleWrite(req, res, 'PATCH', caller);
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
   if (!PAT) return res.status(500).json({ error: 'AIRTABLE_PAT (or ASSETS_PAT) is not set on this deployment.' });
@@ -491,7 +513,7 @@ module.exports = async function handler(req, res) {
           ? 'Could not load the directory — does the assets PAT have read access to the Employees base appraSoUXoTbhroG6?'
           : `Could not load the directory — ${e.message}`;
       }
-      cacheFor(res, 'public, max-age=60');
+      cacheFor(res, 'public, max-age=60', caller);
       return res.status(200).json({
         ok: true,
         choices: {
@@ -533,7 +555,7 @@ module.exports = async function handler(req, res) {
     }
 
     if (qs.stats) {
-      cacheFor(res, 'public, max-age=60');
+      cacheFor(res, 'public, max-age=60', caller);
       return res.status(200).json({ ok: true, stats: buildStats(rows) });
     }
 
@@ -562,7 +584,7 @@ module.exports = async function handler(req, res) {
                     || String(b.media_id).localeCompare(String(a.media_id)));
 
     const limit = Math.min(parseInt(want('limit'), 10) || 1000, 5000);
-    cacheFor(res, 'public, max-age=60');
+    cacheFor(res, 'public, max-age=60', caller);
     return res.status(200).json({ ok: true, media: out.slice(0, limit), count: out.length });
 
   } catch (e) {
