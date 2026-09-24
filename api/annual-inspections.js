@@ -24,6 +24,9 @@
 // Env: ASSETS_PAT / AIRTABLE_PAT (records read+write on the registry base),
 //      ASSETS_BASE, AUTH_URL, WEB_ORIGIN.
 
+// Calendar dates come from New Brunswick's clock, not UTC — see api/_when.js.
+const { todayAtlantic, yearAtlantic } = require('./_when');
+
 const { getCaller, applyCors } = require('./_auth');
 
 const PAT  = process.env.ASSETS_PAT || process.env.AIRTABLE_PAT;
@@ -466,7 +469,7 @@ async function buildWorklist(programmeName, year, force) {
   }
 
   // The year has to come after the rows: it is derived from when they fall due.
-  const thisYear = new Date().getUTCFullYear();
+  const thisYear = yearAtlantic();
   const plan = yearPlan(rows, thisYear);
   const yearAuto = year == null;
   if (yearAuto) year = suggestedYear(plan, thisYear);
@@ -522,7 +525,7 @@ module.exports = async function handler(req, res) {
   const q = req.query || {};
   const has = k => Object.prototype.hasOwnProperty.call(q, k);
   const force = has('fresh');
-  const thisYear = new Date().getUTCFullYear();
+  const thisYear = yearAtlantic();
 
   try {
     if (req.method === 'POST') return await handlePost(req, res, caller);

@@ -21,6 +21,9 @@
 //
 // NO external dependencies.
 
+// Calendar dates come from New Brunswick's clock, not UTC — see api/_when.js.
+const { todayAtlantic } = require('./_when');
+
 const { requireSession, applyCors } = require('./_auth');
 
 const PAT   = process.env.ASSETS_PAT || process.env.AIRTABLE_PAT;
@@ -228,7 +231,7 @@ async function messagesFor(assetId) {
 }
 
 async function nextMessageId() {
-  const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const day = todayAtlantic().replace(/-/g, '');
   const prefix = `AMSG-${day}-`;
   const rows = await fetchAll(BASE, MSG_TABLE, { filterByFormula: `FIND('${prefix}', {message_id} & '') = 1` });
   return prefix + String(rows.length + 1).padStart(3, '0');

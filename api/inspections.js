@@ -26,6 +26,9 @@
 //   INSPECTIONS_TABLE           default 'tblOQpwrLZtyMng08'
 
 // Server-side identity — added 2026-09-23; this endpoint had none.
+// Calendar dates come from New Brunswick's clock, not UTC — see api/_when.js.
+const { yearAtlantic } = require('./_when');
+
 const { requireCallerOrService } = require('./_auth');
 
 const PAT   = process.env.ASSETS_PAT || process.env.AIRTABLE_PAT;
@@ -191,7 +194,7 @@ module.exports = async function handler(req, res) {
 
   const q = req.query || {};
   const has = k => Object.prototype.hasOwnProperty.call(q, k);
-  const thisYear = new Date().getUTCFullYear();
+  const thisYear = yearAtlantic();
 
   try {
     const standard = str(q.standard);

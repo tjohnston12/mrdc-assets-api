@@ -31,6 +31,9 @@
 
 // Server-side identity: the shared htra_session cookie, validated by the auth
 // service. Replaced the spoofable x-user-* headers on 2026-09-23.
+// Calendar dates come from New Brunswick's clock, not UTC — see api/_when.js.
+const { todayAtlantic, yearAtlantic } = require('./_when');
+
 const { requireCallerOrService } = require('./_auth');
 
 const PAT          = process.env.ASSETS_PAT || process.env.AIRTABLE_PAT;
@@ -229,7 +232,7 @@ function coveredKm(rows) {
 
 function buildStats(rows) {
   const live = rows.filter(r => r.status !== 'Archived');
-  const year = String(new Date().getFullYear());
+  const year = String(yearAtlantic());
   return {
     total:      live.length,
     thisYear:   live.filter(r => (r.date_captured || '').startsWith(year)).length,
@@ -295,7 +298,7 @@ function urlProblem(u) {
 // MED-YYYYMMDD-NNN, sequential within the capture date. Generated server-side so
 // it cannot be forged or typo'd, the same reasoning as the MVA number.
 async function nextMediaId(dateStr, rows) {
-  const day = (dateStr || new Date().toISOString().slice(0, 10)).replace(/-/g, '');
+  const day = (dateStr || todayAtlantic()).replace(/-/g, '');
   const prefix = `MED-${day}-`;
   let n = 0;
   for (const r of rows) {
