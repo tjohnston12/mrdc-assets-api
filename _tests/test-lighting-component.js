@@ -96,7 +96,7 @@ const quiet = async fn => { const l = console.log, e = console.error; console.lo
 const call = async (h, o) => { const res = mkRes(); await quiet(() => h(mkReq(o), res)); return res; };
 const ADMIN = { ok: true, allowed: true, apps: ['Assets'], appRole: 'Admin',
   user: { name: 'Troy Johnston', email: 't@mrdc.ca', role: 'Owner', source: 'employee', employeeId: 'recEmp1' } };
-const WANT = ['Pole', 'High Mast Pole', 'Kiosk', 'Junction Box', 'Splice Pit', 'Floodlight'];
+const WANT = ['Pole', 'High Mast Pole', 'Kiosk', 'Junction Box', 'Floodlight'];
 
 (async () => {
   session = ADMIN;
@@ -158,6 +158,13 @@ const WANT = ['Pole', 'High Mast Pole', 'Kiosk', 'Junction Box', 'Splice Pit', '
     const r = await call(fresh(), { method: 'PATCH', body: { rec: 'recKIOSK', detail: { component: 'kiosk', pole_type: 'N/A' } } });
     eq('a mis-cased value is refused (Airtable choices are exact)', r.body && r.body.rejected, ['component']);
     eq('…the rest of the save still goes through', (writes.find(x => x.url.includes(LIGHTING)) || {}).body, { fields: { pole_type: 'N/A' } });
+  }
+  {
+    writes.length = 0;
+    const r = await call(fresh(), { method: 'PATCH', body: { rec: 'recKIOSK', detail: { component: 'Splice Pit' } } });
+    // Troy, 2026-09-29: "a splice pit is the junction box". No longer a separate value.
+    eq('"Splice Pit" is no longer accepted (it is a Junction Box)', r.body && r.body.rejected, ['component']);
+    eq('…nothing written', writes.length, 0);
   }
   {
     writes.length = 0;
