@@ -301,6 +301,29 @@ const DETAIL_NUMERIC = {
   'Structure':          ['year_built', 'total_length_m', 'total_width_m'],
   'Drainage Structure': ['dimensions_mm'],
 };
+// Detail fields that are single-selects in Airtable, with the only values they take.
+// Airtable rejects an unknown choice without typecast, and typecast would silently ADD
+// a new choice from a typo - so the value is checked here, and the forms offer these
+// as a dropdown (returned by ?detailfields and on the single-asset response).
+//
+// Lighting `component` (fldM9MhLmCFHLwWFm), added 2026-09-29: kiosks and junction
+// boxes are part of the lighting system, so they stay asset_type Lighting (OMM 702/703,
+// the Asset ID picker, inspections and counts all key off the type) and this says which
+// kind of equipment a record is. Troy: they are "basic locations for inspection and
+// condition", more fields may come later. Keep in step with the field's choices.
+const DETAIL_CHOICES = {
+  'Lighting': {
+    component: ['Pole', 'High Mast Pole', 'Kiosk', 'Junction Box', 'Splice Pit', 'Floodlight'],
+  },
+};
+// A type's choice fields first, then the rest, so the dropdown that says what the
+// thing IS sits at the top of the form. Choice fields are always offered, even if the
+// row sample happened not to contain one.
+function withChoiceFields(type, names) {
+  const ch = Object.keys(DETAIL_CHOICES[type] || {});
+  return [...ch, ...(names || []).filter(k => !ch.includes(k))];
+}
+
 const DETAIL_CHECKBOX = {
   'Culvert':            ['twin_flag'],
   'Wildlife Fence':     ['wildlife_gate', 'man_gate', 'deer_passage', 'terminates_at_structure'],
@@ -538,7 +561,7 @@ const DETAIL_LOCKED = new Set(['asset_id', 'asset', 'asset_ref', 'source_ref',
 // photo - "managed by the photo flow, not typed by hand" (see below) meant the URL
 // itself is never hand-typed, not that only an admin may use the flow. Every other
 // URL-shaped field (e.g. Structure's master_record_url) stays admin-only.
-function cleanWrite(input, allow, numeric, admin, checkbox, photoAllow) {
+function cleanWrite(input, allow, numeric, admin, checkbox, photoAllow, choices) {
   const out = {}, rejected = [];
   for (const [k, v] of Object.entries(input || {})) {
     if (allow && !allow.has(k)) { rejected.push(k); continue; }
@@ -548,6 +571,14 @@ function cleanWrite(input, allow, numeric, admin, checkbox, photoAllow) {
       if (blocked) { rejected.push(k); continue; }
     }
     if (v === '' || v === null) { out[k] = null; continue; }   // an explicit clear
+    // A select field takes only its listed values; anything else is dropped on its own
+    // (reported back in `rejected`) rather than failing the whole row at Airtable.
+    if (choices && choices[k]) {
+      const val = String(v).trim();
+      if (!choices[k].includes(val)) { rejected.push(k); continue; }
+      out[k] = val;
+      continue;
+    }
     if (numeric && numeric.has(k)) {
       const n = Number(v);
       // Reject just this one field rather than letting Airtable's strict typing
@@ -746,7 +777,8 @@ async function handleCreate(req, res, caller) {
     let detailRec = null, detailError = null;
     const detIn = cleanWrite(body && body.detail, null,
       DETAIL_NUMERIC[type] ? new Set(DETAIL_NUMERIC[type]) : null, true,
-      DETAIL_CHECKBOX[type] ? new Set(DETAIL_CHECKBOX[type]) : null);
+      DETAIL_CHECKBOX[type] ? new Set(DETAIL_CHECKBOX[type]) : null,
+      null, DETAIL_CHOICES[type] || null);
     try {
       const d = await airtableWrite(encodeURIComponent(DETAIL_TABLE[type]), 'POST',
         { records: [{ fields: { ...detIn.fields, asset_id: assetId, asset: [rec.id] } }] });
@@ -831,7 +863,8 @@ async function handlePatch(req, res, caller) {
     const det  = cleanWrite(body.detail, null,
       DETAIL_NUMERIC[asset.category] ? new Set(DETAIL_NUMERIC[asset.category]) : null, admin,
       DETAIL_CHECKBOX[asset.category] ? new Set(DETAIL_CHECKBOX[asset.category]) : null,
-      REG_PHOTO[asset.category] ? new Set(REG_PHOTO[asset.category].urls) : null);
+      REG_PHOTO[asset.category] ? new Set(REG_PHOTO[asset.category].urls) : null,
+      DETAIL_CHOICES[asset.category] || null);
     const rejected = [...core.rejected, ...det.rejected];
     if (!Object.keys(core.fields).length && !Object.keys(det.fields).length) {
       return res.status(400).json({ error: 'Nothing to update', rejected });
@@ -965,6 +998,7 @@ module.exports = async function handler(req, res) {
       if (!table) return res.status(400).json({ error: `"${type}" is not a known asset type.`, types: Object.keys(DETAIL_TABLE) });
       let names = [];
       try { names = await detailFieldNames(table); } catch (_) { names = []; }
+      names = withChoiceFields(type, names);
       cacheFor(res, 'public, max-age=300', caller);
       // numeric/checkbox tell the ADD form which of these plain-named fields need a
       // number or checkbox input instead of free text - without this the create form
@@ -974,6 +1008,7 @@ module.exports = async function handler(req, res) {
         type, table, fields: names,
         numeric: (DETAIL_NUMERIC[type] || []).filter(k => names.includes(k)),
         checkbox: (DETAIL_CHECKBOX[type] || []).filter(k => names.includes(k)),
+        choices: DETAIL_CHOICES[type] || {},
       });
     }
 
@@ -1060,11 +1095,13 @@ module.exports = async function handler(req, res) {
       // `available` lets the edit form show fields that are currently empty.
       let available = [];
       if (detail) { try { available = await detailFieldNames(detail.table); } catch (_) {} }
+      if (detail) available = withChoiceFields(one.category, available);
       return res.status(200).json({
         ...one,
         photo,
         photos: gallery,
-        detail: detail ? { recId: detail.recId, table: detail.table, fields: detail.fields, available } : null,
+        detail: detail ? { recId: detail.recId, table: detail.table, fields: detail.fields, available,
+                           choices: DETAIL_CHOICES[one.category] || {} } : null,
         choices: coreChoices(register),
         ...(duplicates ? { duplicates } : {}),
         ...(diag ? { photoDebug: diag } : {}),
