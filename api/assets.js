@@ -311,9 +311,11 @@ const DETAIL_NUMERIC = {
 // the Asset ID picker, inspections and counts all key off the type) and this says which
 // kind of equipment a record is. Troy: they are "basic locations for inspection and
 // condition", more fields may come later. Keep in step with the field's choices.
+// "Splice Pit" was dropped 2026-09-29 - Troy: "a splice pit is the junction box" - and
+// the 7 splice-pit records were set to Junction Box.
 const DETAIL_CHOICES = {
   'Lighting': {
-    component: ['Pole', 'High Mast Pole', 'Kiosk', 'Junction Box', 'Splice Pit', 'Floodlight'],
+    component: ['Pole', 'High Mast Pole', 'Kiosk', 'Junction Box', 'Floodlight'],
   },
 };
 // A type's choice fields first, then the rest, so the dropdown that says what the
