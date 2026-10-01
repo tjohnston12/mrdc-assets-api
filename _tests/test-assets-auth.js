@@ -215,7 +215,10 @@ const S = (orgRole, appRole, opts = {}) => ({
 /* ── 8. Not signed in, and auth down, are both 401 — never 500, never a pass */
 {
   session = S('Owner', 'User', { allowed: false });
-  eq('a signed-in caller without Assets access is 401', (await call(assets, {})).code, 401);
+  // Until 2026-10-01 this asserted a GET was refused too. Troy changed that rule:
+  // "assets should be available to all" — reads are open to any signed-in
+  // employee (section 9). A WRITE without Assets access is still refused.
+  eq('a signed-in caller without Assets access cannot write (401)', (await call(assets, { method: 'PATCH', body: { rec: 'rec1' } })).code, 401);
 
   session = S('Owner', 'User'); authFails = true;
   const down = await call(assets, {});
@@ -251,6 +254,49 @@ const S = (orgRole, appRole, opts = {}) => ({
      session, or anyone can file a row under a colleague's name. */
   ok('media.js stamps the actor from the session',
      /caller\.name/.test(strip(fs.readFileSync(MEDIA, 'utf8'))));
+}
+
+/* ── 9. Reading the register is open to every signed-in employee ───────────
+   Troy, 2026-10-01: "assets should be available to all". The DMT, Patrol and
+   Timesheets asset pickers read ?all=1; without Assets access they fell back to
+   typing the id. Writes are unchanged. */
+{
+  // An employee with NO Assets access (allowed:false), even with a stale Assets Role.
+  session = S('Employee', 'Admin', { allowed: false });
+  airtableCalls = 0;
+  const g = await call(assets, { query: { all: '1' }, url: '/api/assets?all=1' });
+  ok('no Assets access: GET the register is allowed', g.code !== 401 && g.code !== 403, String(g.code));
+  ok('  ...and gets the register back', !!g.body && (Array.isArray(g.body) || Array.isArray(g.body.assets) || Array.isArray(g.body.data)), JSON.stringify(g.body).slice(0, 120));
+  const r = await AUTH.requireReader(mkReq({}), mkRes());
+  eq('  ...as read-only, whatever the Assets Role says', [r.readOnly, r.canEdit, r.canCreate, r.canAdmin], [true, false, false, false]);
+  for (const [label, o] of [['PATCH', { method: 'PATCH', body: { rec: 'rec1' } }], ['POST (create)', { method: 'POST', body: {} }]]) {
+    airtableCalls = 0;
+    const w = await call(assets, o);
+    eq(`no Assets access: ${label} is still refused`, w.code, 401);
+    eq('  ...before Airtable', airtableCalls, 0);
+  }
+  const dbg = await call(assets, { query: { debug: '1' }, url: '/api/assets?debug=1' });
+  eq('no Assets access: schema discovery is not opened', dbg.code, 403);
+  // Scope: the register only. Media and inspections keep riding on Assets access.
+  eq('no Assets access: media GET unchanged (401)', (await call(media, {})).code, 401);
+  eq('no Assets access: inspections GET unchanged (401)', (await call(inspect, { query: { asset: 'MRDC-CV-1' } })).code, 401);
+
+  // A contractor without Assets access is not "all".
+  session = S('Contractor', '', { allowed: false, source: 'admin' });
+  airtableCalls = 0;
+  eq('a contractor without Assets access still cannot read', (await call(assets, { query: { all: '1' } })).code, 401);
+  eq('  ...and never reached Airtable', airtableCalls, 0);
+
+  // Someone WITH access keeps their write rights on a read.
+  session = S('Employee', 'Manager');
+  const m = await AUTH.requireReader(mkReq({}), mkRes());
+  eq('with Assets access: a reader keeps canEdit', [!!m.readOnly, m.canEdit], [false, true]);
+  // The service key still reads.
+  session = null;
+  const k = await call(assets, { cookie: false, key: 'test-service-key', query: { id: 'MRDC-CV-1' } });
+  ok('the DMT intake key still reads', k.code !== 401, String(k.code));
+  const src = require('fs').readFileSync(ASSETS, 'utf8').replace(/\/\*[\s\S]*?\*\//g, ' ');
+  ok('only GET uses the reader gate', /req\.method === 'GET' \? await requireReader\(req, res\) : await requireCallerOrService\(req, res\)/.test(src));
 }
 
 console.log(`\n  ${pass} passed, ${fail} failed`);
