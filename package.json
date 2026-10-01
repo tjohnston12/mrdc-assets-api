@@ -2,5 +2,5 @@
   "name": "mrdc-assets-api",
   "version": "1.0.0",
   "description": "MRDC HTRA — shared read-only asset register API (Vercel)",
-  "engines": { "node": "20.x" }
+  "engines": { "node": "24.x" }
 }
