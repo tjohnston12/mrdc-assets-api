@@ -134,7 +134,29 @@ async function requireSession(req, res) {
   return caller;
 }
 
+/* READING the register: any signed-in MRDC EMPLOYEE, with or without Assets
+   access, or the DMT intake machine. Troy, 2026-10-01: "assets should be
+   available to all" — the asset pickers in the DMT, Patrol and Timesheets all
+   read this register, and a person without Assets access got "the asset register
+   has not loaded" and had to type the id (which is how typos get in).
+
+   ⚠️ READ ONLY. A caller let in here WITHOUT Assets access has canEdit /
+   canCreate / canAdmin forced false, whatever their Assets Role says — App
+   Access is still what grants a write, and every write path keeps using
+   requireCallerOrService. A contractor (Admins-table session) without Assets
+   access is still refused: "all" means MRDC staff. */
+async function requireReader(req, res) {
+  const caller = await getCaller(req);
+  if (caller && caller.allowed) return caller;
+  if (caller && caller.isStaff) {
+    return Object.assign({}, caller, { canEdit: false, canCreate: false, canAdmin: false, readOnly: true });
+  }
+  if (hasServiceKey(req)) return SERVICE_CALLER;
+  res.status(401).json({ error: 'Not signed in.' });
+  return null;
+}
+
 module.exports = {
-  getCaller, requireSession, requireCallerOrService, hasServiceKey,
+  getCaller, requireSession, requireCallerOrService, requireReader, hasServiceKey,
   applyCors, APP, ORIGIN, SERVICE_CALLER,
 };

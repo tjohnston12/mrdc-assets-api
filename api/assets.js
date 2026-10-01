@@ -29,7 +29,7 @@
 
 // Server-side identity: the shared htra_session cookie, validated by the auth
 // service. Replaced the spoofable x-user-* headers on 2026-09-23.
-const { requireCallerOrService } = require('./_auth');
+const { requireCallerOrService, requireReader } = require('./_auth');
 
 const PAT   = process.env.ASSETS_PAT || process.env.AIRTABLE_PAT;
 const BASE  = process.env.ASSETS_BASE  || 'app0sXrUbOBr7a6vV';
@@ -923,7 +923,9 @@ module.exports = async function handler(req, res) {
      The service key is accepted because DMT Tool's api/intake.js reads
      `?id=<assetId>` from this API server-side while raising a work order. It
      gets no edit rights: SERVICE_CALLER has canEdit/canCreate/canAdmin false. */
-  const caller = await requireCallerOrService(req, res);
+  /* Reads: any signed-in employee (Troy, 2026-10-01: "assets should be available
+     to all"). Writes: Assets access + the role gates, exactly as before. */
+  const caller = req.method === 'GET' ? await requireReader(req, res) : await requireCallerOrService(req, res);
   if (!caller) return;
 
   if (req.method === 'PATCH') return handlePatch(req, res, caller);
@@ -932,6 +934,8 @@ module.exports = async function handler(req, res) {
 
   try {
     const debug = req.query?.debug === '1' || /[?&]debug=1/.test(req.url || '');
+    // Schema discovery is for the people who look after the register.
+    if (debug && caller.readOnly) return res.status(403).json({ error: 'Assets access is needed for that.' });
 
     // Schema discovery — no field map needed, reveals the real column names.
     if (debug) {
