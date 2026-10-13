@@ -16,6 +16,8 @@
 //   GET  ?asset=<asset_id> | ?rec=<recId>  one asset's inspection history
 //   GET  ?criteria=OMM+303               the checklist for a standard
 //   GET  ?summary=1[&programme=Culverts] per-asset rollup
+//   GET  ?rows=1[&programme=Culverts]    every inspection row + a per-asset rollup,
+//                                        for the Assets page's Excel reports (2026-10-13)
 //   POST                                 file an inspection + its findings
 //
 // ⚠️ AN EMPTY FILTER IS AN ERROR, NOT "NO FILTER" — the same rule inspections.js
@@ -418,6 +420,26 @@ function latestFor(rows) {
   return best;
 }
 
+// Per asset, for the reports: the LATEST inspection decides next due, exactly as the
+// one-asset view (?asset=) does — its next_due, else its year + the programme's cycle.
+function reportRollup(rows, thisYear) {
+  const by = {};
+  for (const r of rows) {
+    if (!r.asset_id) continue;
+    (by[r.asset_id] = by[r.asset_id] || []).push(r);
+  }
+  const out = {};
+  for (const [id, list] of Object.entries(by)) {
+    const last = latestFor(list);
+    const prog = last ? PROGRAMME[last.programme] : null;
+    const nextDue = last ? (last.next_due != null ? last.next_due : (yearOf(last.date) + (prog ? prog.years : 2))) : null;
+    out[id] = { count: list.length, lastDate: last ? last.date : null, programme: last ? last.programme : '',
+                standard: last ? last.standard : '', result: last ? last.result : '', inspector: last ? last.inspector : '',
+                nextDue, state: stateFor(nextDue, thisYear) };
+  }
+  return out;
+}
+
 // ── Worklist ─────────────────────────────────────────────────────────────────
 // `year` may be null, meaning "pick the year the work is actually in" (suggestedYear).
 // The returned `year` is always the one the states were computed against, and
@@ -617,6 +639,19 @@ module.exports = async function handler(req, res) {
         state: stateFor(nextDue, thisYear),
         inspections: rows,
       });
+    }
+
+    // ── every row, for the asset reports ────────────────────────────────────
+    // Troy, 2026-10-13: "a report button to export an asset report which would include
+    // inspections". `rows` is its own explicit key — the empty-filter rule above still
+    // holds; this is never what an empty ?asset= turns into.
+    if (has('rows')) {
+      const programmeName = str(q.programme);
+      const rows = (await loadInspections(force))
+        .filter(i => !programmeName || i.programme === programmeName)
+        .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+      res.setHeader('Cache-Control', force ? 'no-store' : 'private, max-age=60');
+      return res.status(200).json({ thisYear, total: rows.length, rows, byAsset: reportRollup(rows, thisYear) });
     }
 
     // ── summary ─────────────────────────────────────────────────────────────
@@ -883,7 +918,7 @@ async function handlePost(req, res, caller) {
 }
 
 module.exports.__test = {
-  stateFor, latestFor, divisionFor, correctBy, responsibilityOf, yearOf,
+  stateFor, latestFor, reportRollup, divisionFor, correctBy, responsibilityOf, yearOf,
   yearPlan, suggestedYear,
   slotsFor, summaryFor, detailFieldList, assetCard, firstDetail, PHOTO_SLOTS, SUMMARY_FIELDS,
   PROGRAMME, TYPE_PROGRAMME, DETAIL_TABLE, buildWorklist, canEdit,

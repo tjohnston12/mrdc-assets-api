@@ -13,6 +13,8 @@
 //   GET ?asset=<asset_id>   one asset's inspections, newest year first, grouped by year
 //   GET ?summary=1          per-asset rollup: count, last year, next due, state
 //   GET ?standard=OMM+501   narrows either of the above
+//   GET ?rows=1             every row + the per-asset rollup, for the Assets page's
+//                           Excel reports (2026-10-13)
 //
 // ⚠️ AN EMPTY FILTER IS AN ERROR, NOT "NO FILTER".
 // On 2026-08-26 this page sent `?asset=` with nothing after it to the NC and DMT
@@ -209,6 +211,21 @@ module.exports = async function handler(req, res) {
       }
       cacheFor(res, 'public, max-age=60', caller);
       return res.status(200).json({ total: rows.length, assets: Object.keys(byAsset).length, thisYear, byAsset });
+    }
+
+    // Every row, for the asset reports (Troy, 2026-10-13: "a report button to export an
+    // asset report which would include inspections"). Its own explicit key — an empty
+    // ?asset= is still a 400 below, never this.
+    if (has('rows')) {
+      const rows = (await allRows()).filter(r => !standard || r.standard === standard).slice().sort(byYearDesc);
+      const by = rollup(rows, thisYear);
+      const byAsset = {};
+      for (const [id, e] of by) {
+        byAsset[id] = { count: e.count, lastYear: e.lastYear, nextDue: e.nextDue,
+                        state: e.state, withReport: e.withReport, standards: e.standards };
+      }
+      cacheFor(res, 'public, max-age=60', caller);
+      return res.status(200).json({ thisYear, total: rows.length, rows, byAsset });
     }
 
     // ⚠️ present-but-empty is a 400, never a silent "everything" — see the header note.
