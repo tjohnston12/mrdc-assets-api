@@ -420,6 +420,84 @@ async function photoIndex() {
   return ids;
 }
 
+// ── The custom report's data (2026-10-13) ───────────────────────────────────
+// Plain cell values: a select/collaborator/attachment becomes its name or url, a list is
+// joined, and a LINK column (an array of record ids) is left out — it means nothing in a
+// spreadsheet. `undefined` = leave the field out entirely.
+const REC_ID = /^rec[A-Za-z0-9]{14}$/;
+function plainValue(v) {
+  if (v == null || v === '') return undefined;
+  if (Array.isArray(v)) {
+    if (v.length && v.every(x => typeof x === 'string' && REC_ID.test(x))) return undefined;
+    const parts = v.map(x => (x && typeof x === 'object') ? (x.name || x.url || x.email || '') : String(x)).filter(Boolean);
+    return parts.length ? parts.join(', ') : undefined;
+  }
+  if (typeof v === 'object') return v.name || v.url || v.email || undefined;
+  return v;
+}
+const REPORT_DETAIL_SKIP = new Set(['asset_id', 'asset']);
+let REPORT_CACHE = { at: 0, raw: null, detail: new Map() };
+async function reportDetail(table) {
+  const hit = REPORT_CACHE.detail.get(table);
+  if (hit && Date.now() - hit.at < TTL_MS) return hit;
+  const byRec = new Map(), byId = new Map(), names = new Set();
+  let offset;
+  do {
+    const qs = new URLSearchParams({ pageSize: '100' });
+    if (offset) qs.set('offset', offset);
+    const page = await airtable(`${table}?${qs}`);
+    for (const r of page.records || []) {
+      const f = r.fields || {}, row = {};
+      for (const [k, v] of Object.entries(f)) {
+        if (REPORT_DETAIL_SKIP.has(k)) continue;
+        const pv = plainValue(v);
+        if (pv === undefined) continue;
+        row[k] = pv; names.add(k);
+      }
+      // The asset LINK is the address; asset_id is only a fallback (101 ids are shared).
+      const links = Array.isArray(f.asset) ? f.asset : [];
+      for (const rec of links) if (!byRec.has(rec)) byRec.set(rec, row);
+      const id = f.asset_id != null ? String(f.asset_id).trim() : '';
+      if (id) byId.set(id, byId.has(id) ? null : row);      // shared id → no fallback
+    }
+    offset = page.offset;
+  } while (offset);
+  const v = { at: Date.now(), byRec, byId, names: [...names].sort() };
+  REPORT_CACHE.detail.set(table, v);
+  return v;
+}
+async function buildReport(types) {
+  if (!REPORT_CACHE.raw || Date.now() - REPORT_CACHE.at >= TTL_MS) REPORT_CACHE = { at: Date.now(), raw: await fetchAll(), detail: REPORT_CACHE.detail };
+  const want = new Set(types);
+  const rows = {}, regNames = new Set(), detail = {};
+  const tables = {};
+  for (const t of types) if (DETAIL_TABLE[t]) tables[t] = await reportDetail(DETAIL_TABLE[t]);
+  // An asset_id carried by more than one register record cannot address a detail row.
+  const idCount = new Map();
+  for (const r of REPORT_CACHE.raw) { const i = (r.fields || {})[F.id]; if (i != null && i !== '') idCount.set(String(i).trim(), (idCount.get(String(i).trim()) || 0) + 1); }
+  for (const r of REPORT_CACHE.raw) {
+    const f = r.fields || {};
+    const type = f[F.category] != null && f[F.category] !== '' ? String(f[F.category]) : '(none)';
+    if (!want.has(type)) continue;
+    const reg = {};
+    for (const [k, v] of Object.entries(f)) {
+      const pv = plainValue(v);
+      if (pv === undefined) continue;
+      reg[k] = pv; regNames.add(k);
+    }
+    const out = { r: reg };
+    const tb = tables[type];
+    if (tb) {
+      const id = f[F.id] != null ? String(f[F.id]).trim() : '';
+      const d = tb.byRec.get(r.id) || (id && idCount.get(id) === 1 ? tb.byId.get(id) : null);
+      if (d) out.d = d;
+      detail[type] = tb.names;
+    }
+    rows[r.id] = out;
+  }
+  return { types, fields: { register: [...regNames].sort(), detail }, rows };
+}
+
 // What counts as "missing" for review. Kept here so the page and any future
 // report agree on the definition rather than each inventing their own.
 const GAPS = [
@@ -992,6 +1070,21 @@ module.exports = async function handler(req, res) {
         byType,
         assets: rows,
       });
+    }
+
+    // ?report=1&types=Culvert,Sign — every register field plus every typed detail field,
+    // for the Assets page's Custom report (Troy, 2026-10-13: "are all fields shown as check
+    // boxes? i seem to think some are missing"). Only the asset types asked for, so a culvert
+    // report does not carry the whole register. `types` is required — an empty list is a
+    // 400, never "everything" (the same rule as the inspection endpoints).
+    const reportQ = req.query?.report === '1' || /[?&]report=1/.test(req.url || '');
+    if (reportQ) {
+      const rawTypes = String(req.query?.types || (/[?&]types=([^&]*)/.exec(req.url || '') || [])[1] || '');
+      const types = [...new Set(decodeURIComponent(rawTypes).split(',').map(t => t.trim()).filter(Boolean))];
+      if (!types.length) return res.status(400).json({ error: 'report=1 needs types= (the asset types in the list).' });
+      const out = await buildReport(types);
+      cacheFor(res, 'public, max-age=60', caller);
+      return res.status(200).json(out);
     }
 
     // ?detailfields=<asset type> - the column list of that type's detail table, so the
