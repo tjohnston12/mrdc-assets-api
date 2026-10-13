@@ -136,6 +136,7 @@ function mod() {
 (async () => {
   resetDb();
   const M = mod();
+  var stateOf = n => M.stateFor(n, require(require('path').join(__dirname, '..', 'api', '_when.js')).yearAtlantic());
 
   // ── divisionFor ────────────────────────────────────────────────────────────
   eq('division: km 300 Route 2 is Western', M.divisionFor({ route: 'Route 2', km: 300 }), 'Western');
@@ -552,6 +553,20 @@ function mod() {
   eq('post: BIENNIAL cycle is due in two years', WRITES.find(w => w.table === T.INSP).body.records[0].fields.next_due, 2029);
 
   // ── report ─────────────────────────────────────────────────────────────────
+  // ── ?rows=1 — every row + a rollup, for the Assets page's Excel reports (2026-10-13) ──
+  resetDb();
+  DB[T.INSP].push(
+    { id: 'recI2', fields: { inspection_id: 'AI-2023-CU-1', asset_id: 'MRDC-CV-1', programme: 'Culverts', standard: 'OMM 303', date: '2023-06-01', year: 2023, next_due: 2025, result: 'Fail', inspector: 'Old Hand' } },
+    { id: 'recI3', fields: { inspection_id: 'AI-2026-SG-1', asset_id: 'MRDC-SG-1', programme: 'Overhead & Ground Mounted Signs', standard: 'OMM 704', date: '2026-05-02', year: 2026, result: 'Pass', inspector: 'Sam Signs' } });
+  r = await call({ query: { rows: '1', fresh: '1' } });
+  eq('rows: 200, every row, newest first', [r.statusCode, r.body.rows.map(x => x.inspection_id)], [200, ['AI-2026-SG-1', 'AI-2025-CU-1', 'AI-2023-CU-1']]);
+  eq('rows: the rollup follows the LATEST inspection, not the oldest', r.body.byAsset['MRDC-CV-1'],
+     { count: 2, lastDate: '2025-06-01', programme: 'Culverts', standard: 'OMM 303', result: 'Pass', inspector: '', nextDue: 2027, state: stateOf(2027) });
+  eq('rows: no next_due on file → the programme\'s own cycle (signs: annual)', r.body.byAsset['MRDC-SG-1'].nextDue, 2027);
+  r = await call({ query: { rows: '1', programme: 'Culverts', fresh: '1' } });
+  eq('rows: narrowed to one programme', r.body.rows.map(x => x.asset_id), ['MRDC-CV-1', 'MRDC-CV-1']);
+  ok('rows: an empty ?asset= is still refused, never widened to this', (await call({ query: { asset: '' } })).statusCode === 400);
+
   console.log(`\n${pass} passed, ${fail} failed`);
   if (fail) { console.log('\nFAILURES:'); for (const f of failures) console.log('  ✗ ' + f); process.exit(1); }
   process.exit(0);

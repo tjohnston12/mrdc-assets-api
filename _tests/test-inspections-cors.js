@@ -84,7 +84,8 @@ function stub(origin, tail) {
   /* Count the CALLS, not the definition — a branch that quietly stops setting
      a header at all would otherwise slip past a ">=" check. */
   const calls = (CODE.match(/cacheFor\(res,/g) || []).length - 1;
-  eq('every cacheable branch goes through it, and none was dropped', calls, 2);
+  // 3 since 2026-10-13: ?summary, ?rows (the Assets page's Excel reports), ?asset.
+  eq('every cacheable branch goes through it, and none was dropped', calls, 3);
   ok('and cacheFor reads the header rather than re-deciding the origin',
      /res\.getHeader\('Access-Control-Allow-Origin'\) \? 'no-store' :/.test(SRC));
   ok('the reason is written down beside it',
