@@ -30,6 +30,7 @@
 // Server-side identity: the shared htra_session cookie, validated by the auth
 // service. Replaced the spoofable x-user-* headers on 2026-09-23.
 const { requireCallerOrService, requireReader } = require('./_auth');
+const { logChange } = require('./_changes');   // who did it, for the daily stats (2026-10-20)
 
 const PAT   = process.env.ASSETS_PAT || process.env.AIRTABLE_PAT;
 const BASE  = process.env.ASSETS_BASE  || 'app0sXrUbOBr7a6vV';
@@ -871,6 +872,9 @@ async function handleCreate(req, res, caller) {
 
     CACHE = { at: 0, data: null, all: null };
     PHOTO_INDEX = { at: 0, ids: null };
+    // Who did it, for the daily stats (api/_changes.js). Best effort; never fails the save.
+    await logChange(caller, { action: 'Asset added', assetId, assetRec: rec.id, assetType: type,
+      assetName: String(fields[F.name] || core.name || ''), detail: `New ${type}` + (detailRec ? ' with its detail record' : '') });
     return res.status(201).json({
       ok: true,
       recId: rec.id,
@@ -968,6 +972,10 @@ async function handlePatch(req, res, caller) {
 
     CACHE = { at: 0, data: null, all: null };   // the list is now stale - force a rebuild
     PHOTO_INDEX = { at: 0, ids: null };
+    // Who did it, for the daily stats (api/_changes.js): the fields changed, by name.
+    await logChange(caller, { action: 'Asset edited', assetId: asset.id, assetRec: asset.recId, assetName: asset.name,
+      assetType: asset.category, detail: 'Changed: ' + [...Object.keys(core.fields).filter(k => k !== F.editedBy && k !== F.editedAt),
+        ...Object.keys(det.fields)].join(', ') });
     return res.status(200).json({
       ok: true,
       id: asset.id,

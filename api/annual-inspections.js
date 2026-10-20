@@ -30,6 +30,7 @@
 const { todayAtlantic, yearAtlantic } = require('./_when');
 
 const { getCaller, applyCors } = require('./_auth');
+const { logChange } = require('./_changes');   // who did it, for the daily stats (2026-10-20)
 
 const PAT  = process.env.ASSETS_PAT || process.env.AIRTABLE_PAT;
 const BASE = process.env.ASSETS_BASE || 'app0sXrUbOBr7a6vV';
@@ -906,6 +907,10 @@ async function handlePost(req, res, caller) {
   }
 
   fresh();
+  await logChange(caller, { action: 'Inspection recorded', assetId: asset ? asset.asset_id : '', assetRec: asset ? asset.recId : '',
+    assetName: asset ? (asset.name || asset.asset_ref || '') : '', assetType: asset ? asset.type : prog.type,
+    detail: `${programmeName} ${inspectionId}: ${result}` + (failures.length ? ` (${failures.length} failed check${failures.length === 1 ? '' : 's'})` : '')
+      + (assetPhotos && assetPhotos.length ? ' · asset photo updated' : '') + (scope === 'Segment' ? ' · segment' : '') });
   return res.status(201).json({
     ok: true,
     inspection: { recId: insp.id, inspection_id: inspectionId, result, next_due: nextDue,

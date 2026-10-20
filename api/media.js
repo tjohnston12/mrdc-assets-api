@@ -35,6 +35,7 @@
 const { todayAtlantic, yearAtlantic } = require('./_when');
 
 const { requireCallerOrService } = require('./_auth');
+const { logChange } = require('./_changes');   // who did it, for the daily stats (2026-10-20)
 
 const PAT          = process.env.ASSETS_PAT || process.env.AIRTABLE_PAT;
 const BASE         = process.env.ASSETS_BASE || 'app0sXrUbOBr7a6vV';
@@ -390,6 +391,8 @@ async function handleWrite(req, res, method, caller) {
         records: [{ fields }],
       });
       invalidate();
+      await logChange(caller, { action: 'Media added', assetId: fields.asset_id || '',
+        detail: [mediaId, fields.title, fields.media_type].filter(Boolean).join(' · ') });
       return res.status(200).json({
         ok: true,
         media: shape(created.records[0]),
@@ -417,6 +420,8 @@ async function handleWrite(req, res, method, caller) {
 
     const updated = await airtableWrite(`${encodeURIComponent(TABLE)}/${existing.recId}`, 'PATCH', { fields });
     invalidate();
+    await logChange(caller, { action: 'Media edited', assetId: fields.asset_id || existing.asset_id || '',
+      detail: `${mediaId} · changed: ${Object.keys(fields).join(', ')}` });
     return res.status(200).json({ ok: true, media: shape(updated), rejected });
 
   } catch (e) {

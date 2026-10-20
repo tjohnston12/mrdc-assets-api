@@ -28,6 +28,7 @@
 //           ASSET_DOCS_TABLE (default tblrPv20XR3B696CB), ASSETS_TABLE (default 'Assets').
 
 const { requireSession } = require('./_auth');
+const { logChange } = require('./_changes');   // who did it, for the daily stats (2026-10-20)
 
 const PAT    = process.env.ASSETS_PAT || process.env.AIRTABLE_PAT;
 const BASE   = process.env.ASSETS_BASE || 'app0sXrUbOBr7a6vV';
@@ -153,6 +154,9 @@ module.exports = async function handler(req, res) {
       if ((cur.fields || {})[F.removedAt]) return res.status(200).json({ ok: true, already: true });
       await airtable(`${TABLE}/${id}`, { method: 'PATCH', body: JSON.stringify({ fields: {
         [F.removedAt]: new Date().toISOString(), [F.removedBy]: caller.name } }) });
+      const cf = cur.fields || {};
+      await logChange(caller, { action: 'Document removed', assetId: cf[F.assetId] || '', assetRec: cf[F.assetRec] || '',
+        assetType: cf[F.assetType] || '', detail: [cf[F.docType] && (cf[F.docType].name || cf[F.docType]), cf[F.title]].filter(Boolean).join(': ') });
       return res.status(200).json({ ok: true, removed: id });
     }
     if (Q.action) return res.status(400).json({ error: 'Unknown action.' });
@@ -196,6 +200,8 @@ module.exports = async function handler(req, res) {
       return res.status(502).json({ error: 'The file did not upload. Nothing was saved — try again.', detail: e.message });
     }
     const fresh = await airtable(`${TABLE}/${created.id}?returnFieldsByFieldId=true`).catch(() => created);
+    await logChange(caller, { action: 'Document uploaded', assetId: String(af['Asset ID'] || ''), assetRec,
+      assetName: String(af['Name'] || ''), assetType: String(af['Category'] || ''), detail: `${docType}: ${title} (${filename})` });
     return res.status(201).json({ ok: true, document: docOut(fresh) });
   } catch (e) {
     console.error('[asset-documents]', e.message);
