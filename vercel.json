@@ -15,6 +15,9 @@
       ]
     }
   ],
+  "crons": [
+    { "path": "/api/asset-stats?digest=1", "schedule": "47 10 * * *" }
+  ],
   "redirects": [
     {
       "source": "/",
