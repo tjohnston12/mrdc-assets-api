@@ -129,6 +129,23 @@ const up = (q, buf) => call('POST', Object.assign({ asset_rec: ASSET, doc_type: 
   eq('remove an unknown → 404', (await call('POST', { action: 'remove', id: R('NOPE') })).code, 404);
   ok('nothing ever DELETEd except the failed half-write', CALLS.filter(c => c.m === 'DELETE').length === 1);
 
+
+  // ── As-Builts, Repair Logs, Reports (Troy, 2026-10-29) ──
+  SESSION = S('Manager', 'Employee');
+  eq('the list says which sections there are', (await call('GET', { asset_rec: ASSET })).body.sections, ['Documents', 'As-Builts', 'Repair Logs', 'Reports']);
+  r = await up({ section: 'As-Builts', doc_type: '', title: '2019 rehabilitation as-builts', filename: 'asb.pdf' });
+  const asb = r.body.document;
+  eq('an As-Built goes up with no document type, in its section', [r.code, asb.section, asb.docType], [201, 'As-Builts', '']);
+  ok('…written to the section field, and no doc_type sent', ROWS[asb.id].fldcPM3LQbawKEY74 === 'As-Builts' && !('fldEE0KPoRRdUl5Kp' in ROWS[asb.id]));
+  r = await up({ section: 'Repair Logs', doc_type: 'Drawing', title: 'Joint repair log', filename: 'log.xlsx' });
+  eq('a Repair Log: a doc_type sent with it is ignored', [r.code, r.body.document.section, r.body.document.docType, 'fldEE0KPoRRdUl5Kp' in ROWS[r.body.document.id]], [201, 'Repair Logs', '', false]);
+  r = await up({ section: 'Reports', title: '2026 condition assessment', filename: 'rpt.docx' });
+  eq('a Report', [r.code, r.body.document.section], [201, 'Reports']);
+  eq('an unknown section → 400', (await up({ section: 'Recipes' })).code, 400);
+  eq('Documents still needs a type', (await up({ section: 'Documents', doc_type: '' })).code, 400);
+  r = await call('GET', { asset_rec: ASSET });
+  const bySec = {}; r.body.documents.forEach(x => { bySec[x.section] = (bySec[x.section] || 0) + 1; });
+  eq('one list, each file knowing its section; older files (no section) are Documents', ['Documents', 'As-Builts', 'Repair Logs', 'Reports'].map(k => bySec[k] || 0), [2, 1, 1, 1]);
   console.log(`\n  test-asset-documents: ${pass} passed, ${fail} failed`);
   failures.forEach(f => console.log('   FAIL ', f));
   process.exit(fail ? 1 : 0);
