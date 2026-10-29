@@ -14,6 +14,7 @@
 //   GET    ?asset_rec=recXXX               the asset's documents, newest first (removed ones left out)
 //   POST   ?asset_rec=recXXX&doc_type=…&title=…&doc_date=…&notes=…&filename=…
 //          body = the file's raw bytes (Content-Type: the file's own type)
+//          + &section=As-Builts | Repair Logs | Reports (2026-10-29) — no doc_type for those
 //   POST   ?action=remove&id=recDOC        hide it from the app (removed_at / removed_by set;
 //                                           the row and the file are KEPT — deletes are Troy's)
 //
@@ -41,7 +42,13 @@ const F = {
   docDate: 'flduIfNmQrzuwYcNU', notes: 'fldIaKcILXtIIVSLD', file: 'flderlrTTcnDtXYT8',
   fileName: 'fldxEycg4Xo9Hmz7v', fileSize: 'fldd81gz9zpOVvOEu', uploadedBy: 'fldUIz4NQGLtvtz2e',
   uploadedAt: 'fldnfkqLOHsF9Esbx', removedAt: 'fldUsOKv2TR0s8Z4V', removedBy: 'fldtXgiCmejDbQ8qA',
+  section: 'fldcPM3LQbawKEY74',
 };
+/* Troy, 2026-10-29: "for asset records along with the documents section, can you add a document
+   upload spot for As-Builts, Repair Logs, and Reports" — three panels of their own, on every
+   asset type. One table: `section` says which panel a file is in. Blank is Documents, which is
+   every file filed before the field existed. Only Documents asks for a document type. */
+const SECTIONS = ['Documents', 'As-Builts', 'Repair Logs', 'Reports'];
 const DOC_TYPES = ['Work sheet', 'Inspection report', 'Drawing', 'Repair / maintenance record', 'Photo log', 'Correspondence', 'Other'];
 const MAX_BYTES = 4 * 1024 * 1024;
 // What a work sheet, report or drawing arrives as. Anything else is refused rather than
@@ -99,6 +106,7 @@ function docOut(r) {
     url: file ? file.url : '', contentType: file ? file.type : '',
     uploadedBy: f[F.uploadedBy] || '', uploadedAt: f[F.uploadedAt] || '',
     removed: !!f[F.removedAt],
+    section: SECTIONS.includes(f[F.section]) ? f[F.section] : 'Documents',
   };
 }
 
@@ -141,7 +149,7 @@ module.exports = async function handler(req, res) {
       // ⚠️ An empty or malformed filter is an error, never "everything" (2026-08-26).
       if (!REC.test(String(Q.asset_rec || ''))) return res.status(400).json({ error: 'Which asset? Pass asset_rec=<record id>.' });
       const docs = await listFor(String(Q.asset_rec));
-      return res.status(200).json({ ok: true, documents: docs, docTypes: DOC_TYPES, canUpload: caller.canEdit === true, maxBytes: MAX_BYTES });
+      return res.status(200).json({ ok: true, documents: docs, docTypes: DOC_TYPES, sections: SECTIONS, canUpload: caller.canEdit === true, maxBytes: MAX_BYTES });
     }
     if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
     if (caller.canEdit !== true) return res.status(403).json({ error: 'Only Assets editors (Assets Role Admin or Manager) can add or remove documents.' });
@@ -156,7 +164,7 @@ module.exports = async function handler(req, res) {
         [F.removedAt]: new Date().toISOString(), [F.removedBy]: caller.name } }) });
       const cf = cur.fields || {};
       await logChange(caller, { action: 'Document removed', assetId: cf[F.assetId] || '', assetRec: cf[F.assetRec] || '',
-        assetType: cf[F.assetType] || '', detail: [cf[F.docType] && (cf[F.docType].name || cf[F.docType]), cf[F.title]].filter(Boolean).join(': ') });
+        assetType: cf[F.assetType] || '', detail: [(cf[F.docType] && (cf[F.docType].name || cf[F.docType])) || cf[F.section], cf[F.title]].filter(Boolean).join(': ') });
       return res.status(200).json({ ok: true, removed: id });
     }
     if (Q.action) return res.status(400).json({ error: 'Unknown action.' });
@@ -164,8 +172,11 @@ module.exports = async function handler(req, res) {
     // ── upload ──
     const assetRec = String(Q.asset_rec || '');
     if (!REC.test(assetRec)) return res.status(400).json({ error: 'Which asset? Pass asset_rec=<record id>.' });
-    const docType = String(Q.doc_type || '');
-    if (!DOC_TYPES.includes(docType)) return res.status(400).json({ error: 'Pick a document type.' });
+    const section = String(Q.section || 'Documents');
+    if (!SECTIONS.includes(section)) return res.status(400).json({ error: 'Which section? ' + SECTIONS.join(', ') + '.' });
+    // The As-Builts / Repair Logs / Reports panels ARE the type; only Documents picks one.
+    const docType = section === 'Documents' ? String(Q.doc_type || '') : '';
+    if (section === 'Documents' && !DOC_TYPES.includes(docType)) return res.status(400).json({ error: 'Pick a document type.' });
     const title = clip(Q.title, 200);
     if (!title) return res.status(400).json({ error: 'Give the document a title.' });
     const docDate = String(Q.doc_date || '');
@@ -186,7 +197,7 @@ module.exports = async function handler(req, res) {
 
     const created = await airtable(TABLE, { method: 'POST', body: JSON.stringify({ typecast: false, fields: {
       [F.documentId]: newId(), [F.assetRec]: assetRec, [F.assetId]: String(af['Asset ID'] || ''), [F.assetType]: String(af['Category'] || ''),
-      [F.docType]: docType, [F.title]: title, ...(docDate ? { [F.docDate]: docDate } : {}), [F.notes]: clip(Q.notes, 2000),
+      ...(docType ? { [F.docType]: docType } : {}), ...(section !== 'Documents' ? { [F.section]: section } : {}), [F.title]: title, ...(docDate ? { [F.docDate]: docDate } : {}), [F.notes]: clip(Q.notes, 2000),
       [F.fileName]: filename, [F.fileSize]: buf.length, [F.uploadedBy]: caller.name, [F.uploadedAt]: new Date().toISOString(),
     } }) });
     try {
@@ -201,11 +212,11 @@ module.exports = async function handler(req, res) {
     }
     const fresh = await airtable(`${TABLE}/${created.id}?returnFieldsByFieldId=true`).catch(() => created);
     await logChange(caller, { action: 'Document uploaded', assetId: String(af['Asset ID'] || ''), assetRec,
-      assetName: String(af['Name'] || ''), assetType: String(af['Category'] || ''), detail: `${docType}: ${title} (${filename})` });
+      assetName: String(af['Name'] || ''), assetType: String(af['Category'] || ''), detail: `${section === 'Documents' ? docType : section}: ${title} (${filename})` });
     return res.status(201).json({ ok: true, document: docOut(fresh) });
   } catch (e) {
     console.error('[asset-documents]', e.message);
     return res.status(500).json({ error: 'Something went wrong with the documents.', detail: e.message });
   }
 };
-module.exports.lib = { DOC_TYPES, MAX_BYTES, TYPES, docOut, F };
+module.exports.lib = { DOC_TYPES, SECTIONS, MAX_BYTES, TYPES, docOut, F };
