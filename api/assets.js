@@ -105,13 +105,52 @@ async function fetchAll() {
   return rows;
 }
 
+/* ── Who maintains it (Troy, 2026-11-03: "apply a filter to assets to hide any that are not MRDC,
+   keep blank ones as they are to be determined" / "mrdc responsibility") ─────────────────────────
+   `maintenance_responsibility` lives on the typed detail tables, not on Assets. Only the rows that
+   say SOMEONE ELSE are read — one filtered query per table, in parallel with the register — and
+   the asset is tagged `responsibility: "<value>"`. MRDC and blank are not tagged: blank means not
+   yet assessed, and stays in the list. 2026-11-03: 91 culverts and 2 drainage structures.
+   Barrier Wall, Gate and Structure Details have no such field, so their assets are never tagged.
+   Fails soft: a table that cannot be read just tags nothing. */
+const RESP_TABLES = ['Culvert Details', 'Guiderail Details', 'Sign Details', 'Lighting Details',
+                     'Wildlife Fence Details', 'Drainage Structure Details'];
+const NOT_MRDC_FORMULA = "AND({maintenance_responsibility}!='', LOWER(TRIM({maintenance_responsibility}))!='mrdc')";
+async function notMrdcMap() {
+  const map = new Map();                        // Assets record id -> who maintains it
+  await Promise.all(RESP_TABLES.map(async t => {
+    try {
+      let offset;
+      do {
+        const qs = new URLSearchParams({ pageSize: '100', filterByFormula: NOT_MRDC_FORMULA });
+        qs.append('fields[]', 'asset'); qs.append('fields[]', 'maintenance_responsibility');
+        if (offset) qs.set('offset', offset);
+        const page = await airtable(`${encodeURIComponent(t)}?${qs}`);
+        for (const r of page.records || []) {
+          const f = r.fields || {}, v = String(f.maintenance_responsibility || '').trim();
+          if (!v || /^mrdc$/i.test(v)) continue;  // the formula is not trusted alone
+          for (const rec of (Array.isArray(f.asset) ? f.asset : [])) if (!map.has(rec)) map.set(rec, v);
+        }
+        offset = page.offset;
+      } while (offset);
+    } catch (e) { console.warn('[assets] responsibility not read from', t, '-', e.message); }
+  }));
+  return map;
+}
+/* The register, read fresh, shaped into the two cached sets, with responsibility tagged. */
+async function rebuildRegister() {
+  const [raw, resp] = await Promise.all([fetchAll(), notMrdcMap()]);
+  CACHE = { at: Date.now(), data: shape(raw, false, resp), all: shape(raw, true, resp) };
+  return raw;
+}
+
 function num(v) {
   if (v == null || v === '') return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
 
-function shape(records, includeUnmapped) {
+function shape(records, includeUnmapped, resp) {
   const out = [];
   for (const r of records) {
     const f = r.fields || {};
@@ -131,6 +170,7 @@ function shape(records, includeUnmapped) {
     if (km != null) asset.km = km;
     if (f[F.ref] != null && f[F.ref] !== '') asset.asset_ref = String(f[F.ref]);
     if (f[F.sourceRef] != null && f[F.sourceRef] !== '') asset.source_ref = String(f[F.sourceRef]);
+    if (resp && resp.has(r.id)) asset.responsibility = resp.get(r.id);   // someone other than MRDC
     for (const [key, fld] of [['direction', F.direction], ['side', F.side], ['offset', F.offset],
                               ['status', F.status], ['intersecting_roads', F.intersects],
                               ['roadway_element', F.roadway], ['ramp_ref', F.rampRef]]) {
@@ -819,8 +859,7 @@ async function handleCreate(req, res, caller) {
   try {
     // Read the register fresh. A cached copy could be up to 5 minutes stale, and a
     // stale uniqueness check is the same as no uniqueness check.
-    const raw = await fetchAll();
-    CACHE = { at: Date.now(), data: shape(raw, false), all: shape(raw, true) };
+    await rebuildRegister();
     const clash = CACHE.all.filter(a => a.id === assetId);
     if (clash.length) {
       return res.status(409).json({
@@ -924,8 +963,7 @@ async function handlePatch(req, res, caller) {
     // save against a shared id landed on whichever record came first. Troy edited a
     // barrier wall three times and all three edits went to a different wall.
     if (!CACHE.all || Date.now() - CACHE.at >= TTL_MS) {
-      const raw = await fetchAll();
-      CACHE = { at: Date.now(), data: shape(raw, false), all: shape(raw, true) };
+      await rebuildRegister();
     }
     const asset = body.rec
       ? CACHE.all.find(a => a.recId === String(body.rec))
@@ -1040,8 +1078,7 @@ module.exports = async function handler(req, res) {
 
     // build (or reuse cached) register — shape once into mappable-only + full sets
     if (!CACHE.data || Date.now() - CACHE.at >= TTL_MS) {
-      const raw = await fetchAll();
-      CACHE = { at: Date.now(), data: shape(raw, false), all: shape(raw, true) };
+      await rebuildRegister();
     }
     // ?all=1 → include assets that have no lat/lng too (for asset pickers, not maps)
     const includeAll = req.query?.all === '1' || /[?&]all=1/.test(req.url || '');
