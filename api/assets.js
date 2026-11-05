@@ -754,7 +754,7 @@ function applyCors(req, res) {
     res.setHeader('Access-Control-Allow-Credentials', 'true');
   }
   res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   /* ⚠️ x-user-* stays in the allow-list although nothing reads it any more: the
      pages still attach those headers, and dropping them here fails the preflight
      before the request is sent. Page first, then this list — never the reverse. */
@@ -1035,6 +1035,121 @@ async function handlePatch(req, res, caller) {
   }
 }
 
+// ── Deleting a duplicate ────────────────────────────────────────────────────
+/* Troy, 2026-11-05: "give emily blaney the right to delete an asset if it is a
+   duplicate, ask to provide a reason."
+
+   Narrower than every other write here, on purpose:
+     · WHO   — the org Owner, plus the people named in ASSET_DELETERS by their
+               Employees record id (read from the validated session, never a
+               header). Not an Assets Role level: Admin is held by others who
+               were not given this.
+     · WHAT  — only a duplicate. The caller names the record being KEPT
+               (`keep`), and it must exist, be a different record and be the same
+               asset type. "Is a duplicate" is therefore something the request
+               has to state, not something the button assumes.
+     · WHY   — a reason of at least 10 characters.
+     · TRACE — a row in Asset Deletions (who, when, why, both records, and a JSON
+               snapshot of the Assets row and its linked detail row) is written
+               FIRST. If that row cannot be written, nothing is deleted.
+
+   The detail row is deleted only when it is LINKED to this exact Assets record —
+   never matched on asset_id text, which is shared by the very duplicates this
+   exists to clean up (§2b). An unlinked detail row is left alone and reported.
+
+   ⚠️ A work order or NC that stores the deleted record's asset_id keeps that
+   text. When the kept record has the SAME asset_id it still resolves; when it
+   does not, it stops resolving. `sameAssetId` in the log and the response says
+   which, and the page warns before the click. */
+const ASSET_DELETERS = new Set([
+  'recqAH6l685WHKlaf',   // Emily Blaney — Records & Assets Assistant
+]);
+const DELETIONS_TABLE = process.env.ASSET_DELETIONS_TABLE || 'Asset Deletions';
+const DEL_REC_ID = /^rec[A-Za-z0-9]{14}$/;
+
+function canDelete(caller) {
+  if (!caller || caller.isService || !caller.isStaff || caller.allowed === false) return false;
+  if (caller.orgRole === 'Owner') return true;
+  const id = caller.user && caller.user.employeeId;
+  return !!id && ASSET_DELETERS.has(String(id));
+}
+
+async function handleDelete(req, res, caller) {
+  if (!canDelete(caller)) return res.status(403).json({ error: 'You do not have the right to delete assets.' });
+
+  let body = req.body;
+  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (_) { body = null; } }
+  body = body || {};
+  const rec = String(body.rec || ''), keep = String(body.keep || '');
+  const reason = String(body.reason || '').trim();
+  if (!DEL_REC_ID.test(rec))  return res.status(400).json({ error: 'rec (the record to delete) is required.' });
+  if (!DEL_REC_ID.test(keep)) return res.status(400).json({ error: 'Name the record this one duplicates (keep).' });
+  if (rec === keep)       return res.status(400).json({ error: 'An asset cannot be a duplicate of itself.' });
+  if (reason.length < 10) return res.status(400).json({ error: 'A reason of at least 10 characters is required.' });
+
+  const actor = String(caller.name || '').trim() || 'unknown';
+  try {
+    if (!CACHE.all || Date.now() - CACHE.at >= TTL_MS) await rebuildRegister();
+    const asset = CACHE.all.find(a => a.recId === rec);
+    const kept  = CACHE.all.find(a => a.recId === keep);
+    if (!asset) return res.status(404).json({ error: 'Asset not found', rec });
+    if (!kept)  return res.status(404).json({ error: 'The record to keep was not found', keep });
+    if ((asset.category || '') !== (kept.category || '')) {
+      return res.status(409).json({ error: 'A duplicate must be the same asset type as the record kept.',
+        deleting: asset.category || '', keeping: kept.category || '' });
+    }
+
+    // Snapshot exactly what Airtable holds, before anything changes.
+    const raw = await airtable(`${encodeURIComponent(TABLE)}/${rec}`);
+    let detail = null;
+    const dTable = DETAIL_TABLE[asset.category];
+    if (dTable) {
+      const qs = new URLSearchParams({ pageSize: '25',
+        filterByFormula: `{asset_id}='${String(asset.id).replace(/'/g, "\\'")}'` });
+      const j = await airtable(`${dTable}?${qs}`);
+      const linked = (j.records || []).filter(r => linksToRecord(r, rec));
+      if (linked.length === 1) detail = { table: dTable, recId: linked[0].id, fields: linked[0].fields || {} };
+    }
+    const sameAssetId = asset.id === kept.id;
+    const now = new Date().toISOString();
+
+    // 1. The record of the deletion. Fails closed: no row, no delete.
+    await airtableWrite(encodeURIComponent(DELETIONS_TABLE), 'POST', { fields: {
+      'Deletion':              `${asset.id || asset.name || rec} · duplicate of ${kept.id || keep} · ${actor}`.slice(0, 250),
+      'Deleted At':            now,
+      'Deleted By':            actor,
+      'Deleted By ID':         String((caller.user && caller.user.employeeId) || ''),
+      'Reason':                reason.slice(0, 5000),
+      'Deleted Asset ID':      String(asset.id || ''),
+      'Deleted Record':        rec,
+      'Deleted Name':          String(asset.name || ''),
+      'Asset Type':            String(asset.category || ''),
+      'Duplicate Of Asset ID': String(kept.id || ''),
+      'Duplicate Of Record':   keep,
+      'Same Asset ID':         sameAssetId,
+      'Detail Table':          detail ? detail.table : '',
+      'Detail Record':         detail ? detail.recId : '',
+      'Snapshot':              JSON.stringify({ asset: { id: rec, fields: raw.fields || {} },
+                                                detail: detail ? { id: detail.recId, fields: detail.fields } : null }).slice(0, 95000),
+    } });
+
+    // 2. The detail row first, so a failure part-way never leaves an orphan
+    //    detail row behind a deleted asset.
+    if (detail) await airtableWrite(`${detail.table}/${detail.recId}`, 'DELETE');
+    // 3. The asset.
+    await airtableWrite(`${encodeURIComponent(TABLE)}/${rec}`, 'DELETE');
+
+    CACHE = { at: 0, data: null, all: null };
+    PHOTO_INDEX = { at: 0, ids: null };
+    return res.status(200).json({ ok: true, deleted: rec, assetId: asset.id, kept: keep, keptAssetId: kept.id,
+      sameAssetId, detailDeleted: detail ? detail.recId : null, deletedBy: actor, deletedAt: now });
+  } catch (e) {
+    console.error('assets DELETE error:', e);
+    return res.status(e.status || 500).json({ error: 'Delete failed', detail: e.message,
+      hint: e.status === 404 || e.status === 422 ? 'Check the Asset Deletions table exists in ' + BASE + ' with the expected columns.' : undefined });
+  }
+}
+
 // Exported for tests: the gap definitions are the one thing the page, this API and
 // any future report all have to agree on.
 module.exports = async function handler(req, res) {
@@ -1054,9 +1169,15 @@ module.exports = async function handler(req, res) {
 
   if (req.method === 'PATCH') return handlePatch(req, res, caller);
   if (req.method === 'POST')  return handleCreate(req, res, caller);
+  if (req.method === 'DELETE') return handleDelete(req, res, caller);
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
+    // The page asks whether to offer the Delete-duplicate button.
+    if (req.query?.can === 'delete' || /[?&]can=delete/.test(req.url || '')) {
+      cacheFor(res, 'private, no-store', caller);
+      return res.status(200).json({ canDelete: canDelete(caller) });
+    }
     const debug = req.query?.debug === '1' || /[?&]debug=1/.test(req.url || '');
     // Schema discovery is for the people who look after the register.
     if (debug && caller.readOnly) return res.status(403).json({ error: 'Assets access is needed for that.' });
@@ -1266,4 +1387,4 @@ module.exports = async function handler(req, res) {
   }
 };
 
-module.exports.__test = { GAPS, linksToRecord };
+module.exports.__test = { GAPS, linksToRecord, canDelete, ASSET_DELETERS };
